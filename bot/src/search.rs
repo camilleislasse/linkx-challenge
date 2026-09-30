@@ -77,7 +77,7 @@ fn key_after_move(h: u64, pos: &Position, m: Move) -> u64 {
     let z = zobrist();
     let p = pos.active as usize;
     let mut h = h ^ z.white_to_move;
-    let mut placed = pos.move_cells(m);
+    let mut placed = pos.legal_move_cells(m);
     while placed != 0 {
         h ^= z.cells[p][placed.trailing_zeros() as usize];
         placed &= placed - 1;
@@ -293,7 +293,7 @@ impl Search {
             } else if Some(m) == counter {
                 (3, 0, 0)
             } else {
-                let on_path = if paths != 0 { (pos.move_cells(m) & paths).count_ones() as u64 } else { 0 };
+                let on_path = if paths != 0 { (pos.legal_move_cells(m) & paths).count_ones() as u64 } else { 0 };
                 (4, on_path, self.history[move_index(m)] as i64)
             };
             let key = (class << 50) | ((81 - on_path) << 40) | ((1i64 << 31) - history) as u64;
@@ -459,6 +459,9 @@ impl Search {
                     singular = others < singular_beta;
                 }
             }
+        }
+        if depth == 1 {
+            self.scratch.set_parent(pos.cells[pos.active as usize]);
         }
         for i in 0..keys.len() {
             // Les premiers coups sont choisis un à un : une coupure arrive

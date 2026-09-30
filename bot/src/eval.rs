@@ -65,6 +65,28 @@ impl Groups {
         Groups { comps: [MaybeUninit::uninit(); MAX_GROUPS], halo: [MaybeUninit::uninit(); MAX_GROUPS], n: 0, own: None }
     }
 
+    /// Composantes de `own` = celles de `base` plus une pièce `added` d'un seul
+    /// tenant : les composantes qu'elle touche fusionnent avec elle, les autres
+    /// restent telles quelles.
+    fn fill_from(&mut self, base: &Groups, own: u128, added: u128) {
+        self.own = Some(own);
+        self.n = 0;
+        let mut merged = added;
+        for i in 0..base.n {
+            let (comp, halo) = (base.comp(i), base.halo(i));
+            if halo & added != 0 {
+                merged |= comp;
+            } else {
+                self.comps[self.n] = MaybeUninit::new(comp);
+                self.halo[self.n] = MaybeUninit::new(halo);
+                self.n += 1;
+            }
+        }
+        self.comps[self.n] = MaybeUninit::new(merged);
+        self.halo[self.n] = MaybeUninit::new(expand(merged));
+        self.n += 1;
+    }
+
     /// Entre deux coups frères, les cases du joueur qui n'a pas posé ne changent
     /// pas : ses composantes sont alors gardées.
     fn fill(&mut self, own: u128) {
@@ -193,6 +215,15 @@ fn width(groups: &Groups, empty: u128, from: u128, to: u128, d: i32, forward: &L
 }
 
 /// Cases vides situées sur au moins un plus court chemin de `from` à `to`.
+/// Cases vides des plus courts chemins de longueur `d`, les couches depuis
+/// `from` étant déjà calculées.
+fn on_shortest_paths(groups: &Groups, empty: u128, from: u128, to: u128, d: i32, forward: &Layers) -> u128 {
+    let mut backward = Layers::new();
+    layers(groups, empty, to, from, &mut backward);
+    let exactly = |l: &Layers, k: i32| l.get(k as usize) & !if k > 0 { l.get(k as usize - 1) } else { 0 };
+    (1..=d).fold(0, |acc, k| acc | (empty & exactly(forward, k) & exactly(&backward, d + 1 - k)))
+}
+
 fn shortest_cells(groups: &Groups, empty: u128, from: u128, to: u128) -> u128 {
     let mut forward = Layers::new();
     let mut backward = Layers::new();
@@ -297,11 +328,118 @@ pub fn end_weights() -> [f64; F] {
 pub struct Scratch {
     mine: Groups,
     theirs: Groups,
+    /// Cases du joueur qui pose, au nœud parent des feuilles évaluées : ses
+    /// composantes servent de base aux feuilles, calculées dès la deuxième.
+    parent: Option<u128>,
+    base: Groups,
+    seen: u32,
+    /// Axes du joueur qui ne pose pas, calculés sur le plateau du parent.
+    memo: Option<AxisMemo>,
+    /// Plateau vu une fois : les axes ne sont mémorisés qu'à la deuxième.
+    candidate: Option<(u128, u128)>,
 }
+
+/// Distance (réserve comprise) et cases des plus courts chemins de chaque axe,
+/// pour les cases `own` d'un joueur et les cases vides `empty`. Une pièce posée
+/// hors de ces chemins ne change ni la distance ni la largeur de l'axe.
+struct AxisMemo {
+    own: u128,
+    empty: u128,
+    d: [i32; 2],
+    sp: [u128; 2],
+}
+
+const AXES: [(u128, u128); 2] = [(COL_LEFT, COL_RIGHT), (ROW_TOP, ROW_BOTTOM)];
 
 impl Scratch {
     pub fn new() -> Scratch {
-        Scratch { mine: Groups::empty(), theirs: Groups::empty() }
+        Scratch { mine: Groups::empty(), theirs: Groups::empty(), parent: None, base: Groups::empty(), seen: 0, memo: None, candidate: None }
+    }
+
+    /// Les feuilles qui suivent sont les coups du joueur dont `cells` sont les cases.
+    pub fn set_parent(&mut self, cells: u128) {
+        if self.parent != Some(cells) {
+            self.parent = Some(cells);
+            self.seen = 0;
+        }
+    }
+
+    /// `axes_with` pour le joueur qui ne vient pas de poser (composantes déjà
+    /// dans `mine`) : entre coups frères, un axe dont les plus courts chemins
+    /// évitent la pièce posée garde sa distance et sa largeur.
+    fn my_axes(&mut self, pos: &Position, me: usize) -> (i32, i32, u32) {
+        let p = params();
+        let own = pos.cells[me];
+        let mover = pos.cells[1 - me];
+        let empty = FULL & !pos.occupied();
+        let added = self.parent.map_or(0, |parent| if parent & !mover == 0 { mover & !parent } else { 0 });
+        if p.hang_wall > 0 || added == 0 {
+            return axes_with(pos, me, &self.mine);
+        }
+        let parent_empty = empty | added;
+        let reserve = reserve_cells(pos, me);
+        let alive = |d: i32| if d > reserve { UNREACHABLE } else { d };
+        if !matches!(&self.memo, Some(m) if m.own == own && m.empty == parent_empty) {
+            if self.candidate != Some((own, parent_empty)) {
+                self.candidate = Some((own, parent_empty));
+                return axes_with(pos, me, &self.mine);
+            }
+            let mut d = [UNREACHABLE; 2];
+            let mut sp = [0u128; 2];
+            for (a, &(from, to)) in AXES.iter().enumerate() {
+                let mut forward = Layers::new();
+                d[a] = alive(layers_within(&self.mine, parent_empty, from, to, reserve, &mut forward));
+                if d[a] > 0 && d[a] < UNREACHABLE {
+                    sp[a] = on_shortest_paths(&self.mine, parent_empty, from, to, d[a], &forward);
+                }
+            }
+            self.memo = Some(AxisMemo { own, empty: parent_empty, d, sp });
+        }
+        let memo = self.memo.as_ref().unwrap();
+        let mut d = [0; 2];
+        let mut forward = [Layers::new(), Layers::new()];
+        let mut kept = [false; 2];
+        for (a, &(from, to)) in AXES.iter().enumerate() {
+            if added & memo.sp[a] == 0 {
+                d[a] = memo.d[a];
+                kept[a] = true;
+            } else {
+                d[a] = alive(layers_within(&self.mine, empty, from, to, reserve, &mut forward[a]));
+            }
+        }
+        let near = d[0].min(d[1]);
+        let w = if p.width == 0 || near == 0 || near >= UNREACHABLE {
+            0
+        } else {
+            let a = if d[0] <= d[1] { 0 } else { 1 };
+            if kept[a] {
+                memo.sp[a].count_ones()
+            } else {
+                width(&self.mine, empty, AXES[a].0, AXES[a].1, near, &forward[a])
+            }
+        };
+        (near, d[0].max(d[1]), w)
+    }
+
+    /// Composantes du joueur qui vient de poser, depuis la base quand c'est possible.
+    fn fill_mover(&mut self, own: u128) {
+        if self.theirs.own == Some(own) {
+            return;
+        }
+        if let Some(parent) = self.parent {
+            let added = own & !parent;
+            if parent & !own == 0 && added != 0 && flood(added, added & added.wrapping_neg()) == added {
+                self.seen += 1;
+                if self.seen >= 2 {
+                    if self.base.own != Some(parent) {
+                        self.base.fill(parent);
+                    }
+                    self.theirs.fill_from(&self.base, own, added);
+                    return;
+                }
+            }
+        }
+        self.theirs.fill(own);
     }
 }
 
@@ -316,10 +454,10 @@ fn feature_vector(pos: &Position, all: bool, scratch: &mut Scratch) -> ([f64; F]
     let me = pos.active as usize;
     let opp = 1 - me;
     scratch.mine.fill(pos.cells[me]);
-    scratch.theirs.fill(pos.cells[opp]);
+    scratch.fill_mover(pos.cells[opp]);
+    let (mn, mf, mw) = scratch.my_axes(pos, me);
     let (my_groups, their_groups) = (&scratch.mine, &scratch.theirs);
-    let (mn, mf, mw) = axes_with(pos, me, &my_groups);
-    let (on, of, ow) = axes_with(pos, opp, &their_groups);
+    let (on, of, ow) = axes_with(pos, opp, their_groups);
     let cap = |w: u32| w.min(p.width_cap as u32) as f64;
     let ((my_zone, my_count), (their_zone, their_count)) = (my_groups.stats(), their_groups.stats());
     let zones = (my_zone - their_zone) as f64;
@@ -423,6 +561,77 @@ mod tests {
             reached = next;
         }
         UNREACHABLE
+    }
+
+    #[test]
+    fn composantes_mises_a_jour_identiques() {
+        use crate::board::{After, Player};
+        let mut state = 0xD1B5_4A32_D192_ED03u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let sorted = |g: &Groups| {
+            let mut v: Vec<(u128, u128)> = (0..g.n).map(|i| (g.comp(i), g.halo(i))).collect();
+            v.sort();
+            v
+        };
+        let mut checked = 0;
+        for _ in 0..2000 {
+            let mut pos = Position::new(Player::Blue);
+            loop {
+                let moves = pos.legal_moves(pos.active);
+                let m = moves[(rand() % moves.len() as u64) as usize];
+                let mover = pos.active as usize;
+                let before = pos.cells[mover];
+                let base = Groups::new(before);
+                let after = pos.play(m);
+                let own = pos.cells[mover];
+                let mut updated = Groups::empty();
+                updated.fill_from(&base, own, own & !before);
+                assert_eq!(sorted(&updated), sorted(&Groups::new(own)));
+                checked += 1;
+                if !matches!(after, After::Next | After::Pass) {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 20_000);
+    }
+
+    #[test]
+    fn evaluation_des_coups_freres_identique() {
+        use crate::board::{After, Player};
+        let mut state = 0x2F7A_1C3B_9D4E_5A61u64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut scratch = Scratch::new();
+        let mut checked = 0;
+        for _ in 0..600 {
+            let mut pos = Position::new(Player::Blue);
+            loop {
+                let moves = pos.legal_moves(pos.active);
+                scratch.set_parent(pos.cells[pos.active as usize]);
+                for &m in &moves {
+                    let mut child = pos.clone();
+                    if let After::Next = child.play(m) {
+                        assert_eq!(evaluate_detailed_with(&child, &mut scratch), evaluate_detailed(&child));
+                        checked += 1;
+                    }
+                }
+                let m = moves[(rand() % moves.len() as u64) as usize];
+                if !matches!(pos.play(m), After::Next | After::Pass) {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 100_000, "{checked}");
     }
 
     #[test]

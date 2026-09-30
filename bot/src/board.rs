@@ -156,10 +156,15 @@ pub struct Position {
 struct Profile {
     shape: u8,
     orient: u8,
-    width: u8,
+    /// Colonnes d'ancrage possibles.
+    range: u16,
     base: u8,
-    steps: [i8; 3],
+    /// Case de `Relief::steps` de chaque marche ; `ANY` au-delà de la largeur.
+    steps: [u8; 3],
 }
+
+/// Case de `Relief::steps` qui laisse tout passer.
+const ANY: u8 = 8;
 
 fn profiles() -> &'static [Profile] {
     static CACHE: OnceLock<Vec<Profile>> = OnceLock::new();
@@ -167,11 +172,12 @@ fn profiles() -> &'static [Profile] {
         let mut all = Vec::new();
         for (shape, list) in orientations().iter().enumerate() {
             for (orient, o) in list.iter().enumerate() {
-                let mut steps = [0i8; 3];
+                let mut steps = [ANY; 3];
                 for i in 1..o.width as usize {
-                    steps[i - 1] = o.bottom[i - 1] as i8 - o.bottom[i] as i8;
+                    steps[i - 1] = (o.bottom[i - 1] as i8 - o.bottom[i] as i8 + 3) as u8;
                 }
-                all.push(Profile { shape: shape as u8, orient: orient as u8, width: o.width, base: o.bottom[0], steps });
+                let range = (1u16 << (10 - o.width)) - 1;
+                all.push(Profile { shape: shape as u8, orient: orient as u8, range, base: o.bottom[0], steps });
             }
         }
         all
@@ -181,17 +187,15 @@ fn profiles() -> &'static [Profile] {
 /// Colonnes par marche (`steps[d + 3]` : colonnes `c` où `h[c + 1] - h[c] = d`)
 /// et par place disponible (`room[b]` : colonnes où `h[c] + b <= 8`).
 struct Relief {
-    steps: [u16; 7],
+    /// Marches de −3 à +3, puis une case ignorée, puis `ANY`.
+    steps: [u16; 9],
     room: [u16; 4],
 }
 
 impl Relief {
     fn columns(&self, p: &Profile) -> u16 {
-        let mut m = self.room[p.base as usize] & ((1u16 << (10 - p.width)) - 1);
-        for i in 1..p.width as usize {
-            m &= self.steps[(p.steps[i - 1] + 3) as usize] >> (i - 1);
-        }
-        m
+        let s = &self.steps;
+        self.room[p.base as usize] & p.range & s[p.steps[0] as usize] & (s[p.steps[1] as usize] >> 1) & (s[p.steps[2] as usize] >> 2)
     }
 }
 
@@ -241,6 +245,14 @@ impl Position {
     }
 
     /// Cases qu'occuperait un coup légal.
+    /// Cases d'un coup légal : sans trou, la pièce s'arrête quand le bas de sa
+    /// première colonne touche la pile.
+    pub fn legal_move_cells(&self, m: Move) -> u128 {
+        let o = m.orientation();
+        let row = 8 - self.heights[m.column as usize] as u32 - o.bottom[0] as u32;
+        o.mask << (row * 9 + m.column as u32)
+    }
+
     pub fn move_cells(&self, m: Move) -> u128 {
         let o = m.orientation();
         let row = self.drop_row(o, m.column).unwrap_or(0);
@@ -302,13 +314,13 @@ impl Position {
 
     fn relief(&self) -> Relief {
         let h = &self.heights;
-        let mut steps = [0u16; 7];
+        // Marches de −3 à +3 ; les autres vont dans une case ignorée.
+        const SLOT: [usize; 19] = [7, 7, 7, 7, 7, 7, 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7];
+        let mut steps = [0u16; 9];
         for c in 0..N - 1 {
-            let d = h[c + 1] as i8 - h[c] as i8;
-            if (-3..=3).contains(&d) {
-                steps[(d + 3) as usize] |= 1 << c;
-            }
+            steps[SLOT[(h[c + 1] as i32 - h[c] as i32 + 9) as usize]] |= 1 << c;
         }
+        steps[ANY as usize] = 0xFFFF;
         // Sans trou, une colonne a au moins `b + 1` cases libres si sa case de la
         // ligne `b` (depuis le haut) est vide.
         let empty = FULL & !self.occupied();
@@ -340,7 +352,8 @@ impl Position {
     /// Pose un coup **légal** du joueur au trait, sans résoudre la suite du tour.
     pub fn place(&mut self, m: Move) {
         let o = m.orientation();
-        let row = self.drop_row(o, m.column).expect("coup illégal");
+        let row = 8 - self.heights[m.column as usize] as i32 - o.bottom[0] as i32;
+        debug_assert_eq!(self.drop_row(o, m.column), Ok(row), "coup illégal");
         let p = self.active as usize;
         self.cells[p] |= o.mask << (row as u32 * 9 + m.column as u32);
         for dx in 0..o.width as usize {
