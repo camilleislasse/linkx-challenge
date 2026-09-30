@@ -1,85 +1,86 @@
-# LinkxMaster
+# Journal des essais
 
-Bot pour le [tournoi Linkx](https://marmelab.com/linkx/) de marmelab
+Chaque idée est mesurée sur le banc (`labo/target/release/arena`) contre la version gardée précédente, à temps égal. Une idée n'est gardée que si le banc la montre gagnante. Les versions gardées sont figées dans `labo/versions/`.
 
-Linkx se joue sur un plateau de 9 × 9 : chaque joueur fait tomber ses pièces
-(des polyominos) dans les colonnes, et gagne en reliant deux bords opposés.
-Chaque IA du tournoi est un service HTTP que la plateforme appelle à chaque
-coup.
-
-## Le moteur
-
-Écrit en Rust, dans `bot/` :
-
-- **Plateau en bitboards** : le plateau n'a jamais de trou, une position se
-  résume à deux masques de 81 bits et à la hauteur des colonnes.
-- **Recherche alpha-bêta** (PVS) à approfondissement itératif, avec table de
-  transposition, coups tueurs, historique, réductions des coups tardifs et
-  ProbCut ; recherche parallèle sur plusieurs cœurs (Lazy SMP) ; résolution
-  exacte des fins de partie.
-- **Évaluation** : distance de chaque joueur à la connexion (parcours en
-  largeur sur les groupes de pièces), largeur des chemins, zones, mobilité,
-  réserve de pièces ; poids réglés automatiquement sur des parties
-  (méthode de Texel), différents en début et en fin de partie.
-- **Livre d'ouverture** calculé hors ligne pour les départs imposés du tournoi.
-- **Réflexion pendant le tour adverse**, et marge de sécurité sur le délai
-  de réponse.
-
-## Organisation
+Commande type :
 
 ```
-bot/
-├── src/            le moteur (bibliothèque)
-│   └── bin/
-│       ├── server.rs   le service HTTP appelé par la plateforme
-│       └── play.rs     le même moteur en ligne de commande
-├── data/           le livre d'ouverture
-├── Dockerfile
-├── compose.yaml
-└── compose.traefik.yaml
+labo/target/release/arena --a "<candidate>" --b labo/versions/vN/play --budget 100 --games 600 --sprt 0,20 --concurrency 4
 ```
 
-## Lancer
+Les versions gardées et leurs mesures sont dans [`docs/versions.md`](docs/versions.md).
 
-Avec Docker :
+## Essais
 
-```
-cd bot
-echo "LINKX_BOT_SECRET=<secret de la plateforme>" > .env
-docker compose up -d --build
-curl http://127.0.0.1:21345/health
-```
-
-Ou directement avec Rust :
-
-```
-cd bot
-cargo build --release
-LINKX_BOT_SECRET=<secret> PORT=21345 target/release/server
-```
-
-Un coup en ligne de commande (budget en millisecondes, puis la partie en
-notation Linkx) :
-
-```
-printf '3000\t4Tr24 3Ir15\n' | target/release/play
-```
-
-Le détail du déploiement (relais HTTPS, changement de version, en cas de
-souci) est dans [`CLAUDE.md`](CLAUDE.md).
-
-## Réglages
-
-Tout se règle par variables d'environnement :
-
-| Variable | Rôle | Défaut |
-|---|---|---|
-| `LINKX_BOT_SECRET` | secret partagé avec la plateforme (signature HMAC) | — |
-| `PORT` | port d'écoute | 21345 dans Docker |
-| `SEARCH_BUDGET_MS` | temps de réflexion par coup | 4500 |
-| `RESPONSE_MARGIN_MS` | marge gardée sur le délai de la plateforme | 1200 |
-| `LINKX_SEARCH_THREADS` | cœurs utilisés par recherche | 1 |
-| `LINKX_BOOK` | fichier du livre d'ouverture | aucun |
-
-Les versions sont étiquetées (`v11`, `v12`…) : le serveur fait toujours
-tourner une étiquette précise.
+| # | Idée | Résultat | Décision |
+| --- | --- | --- | --- |
+| 0 | Première évaluation (zone pesant 10) contre la maison, 700 ms chacun, 34 parties | 26 %, 9 défaites sur 12 au blocage | La plus grande zone décide souvent la partie : son poids croît désormais avec le remplissage (→ v1) |
+| 1 | Gravité : une case vide coûte davantage par case vide sous elle (+½ case, +1 case par case vide dessous) | −30 Elo (435 parties), −89 Elo (172 parties) | Rejetée. Les cases sous un chemin sont remplies par l'un ou l'autre joueur, et la pénalité compte deux fois les cases d'un chemin vertical. |
+| 2 | Même calcul que v1, mais 1,7× plus lent | −8 Elo (600 parties), dans le bruit | La vitesse n'est pas notre goulot : c'est l'évaluation. |
+| 3 | Tempo 0 ou 700 (au lieu de 300) | −5 / −3 Elo (600 parties) | Sans effet, on garde 300. |
+| 4 | Zone par case occupée : 1 ou 8 (au lieu de 3) | −13 Elo / **+55 Elo** (SPRT, 318 parties) | 8 gagne : la zone doit peser plus lourd. |
+| 5 | Second axe : 30 ou 300 (au lieu de 100) | +8 Elo / **+86 Elo** (SPRT, 203 parties) | 300 gagne : menacer les deux axes à la fois est une arme. |
+| 6 | Pousser plus loin et combiner, contre v1 | zone 8 + axe 600 : +88 · axe 300 : +86 · zone 15 : +57 · zone 8 + axe 300 : +56 · axe 600 : +47 | Écarts dans la marge d'erreur : finale directe. |
+| 7 | Finale contre « axe 300 » | zone 8 + axe 600 : **+30** (SPRT, 587 parties) · zone 8 + axe 300 : +29 · zone 15 + axe 300 : +10 | **Zone 8 + second axe 600 → v2** |
+| 8 | Largeur du chemin (poids 100 ou 300, plafond 8 ou 16) contre v2 | +15 / +11 / +10 Elo (800 parties chacun) ; cumul 51,7 % sur 2 400 parties, ≈ +12 Elo | Petit gain, réel mais modeste. Largeur 100 → **v3**. Elle coûte cher en calcul (0,7 M positions/s au lieu de 1,9) : à optimiser. |
+| 9 | Banc de positions à valeur exacte (pêche de fins de partie résolues), calibré sur v1, v2 et v3 | 99,0 % / 99,5 % / 100 % de bons coups | Rejeté : l'examen est trop facile, les positions résolubles en 1 s sont déjà résolues par l'IA en 100 ms. Les duels restent l'outil principal. |
+| 10 | Mur suspendu (idée de marmelab, recodée) : une case vide avec k cases vides dessous devient un mur pour l'axe vertical | k=3 : −400 (22 parties) · k=2 : −99 · k=4 : −123 · k=3 sur deux axes : −53 | Rejeté. La ligne du haut est presque toute suspendue en début de partie : l'axe vertical devient infranchissable, et notre IA perd l'arme des deux axes qui lui avait rapporté +86. |
+| 11 | Réduction des coups tardifs (LMR) à partir du 2ᵉ, 3ᵉ ou 5ᵉ coup | −6 / +11 / +17 Elo (800 parties chacun) | Tendance positive (réduire moins est mieux), rien de prouvé. À confirmer sur le 5ᵉ coup. |
+| 12 | Inspection du mur : une position évaluée 2 924 sans mur passe à 10 524 avec | Un axe « infranchissable » vaut 20 cases × 600 (poids du second axe) : falaise de 9 000 points | Hypothèse : effet de falaise, pas un bug. Test d'un plafond « axe mort = 10 », avec et sans mur, et du mur rejoué avec d'autres ouvertures. |
+| 13 | Plafond « axe mort = 10 » · plafond + mur · mur seul (autres ouvertures) | +19 Elo (800) · −4 Elo (800) · −458 Elo (15, reproduit) | Hypothèse confirmée : la falaise causait le désastre du mur. Le mur adouci est neutre, on l'abandonne. Le plafond est une tendance positive. |
+| 14 | Candidate v4 = plafond 10 + LMR dès le 5ᵉ coup, contre v3, SPRT [0, 15] jusqu'à 2 000 parties | −14 Elo [−34, +7] sur 1 125 parties | Rejetée : les +17 et +19 isolés étaient du bruit. Règle désormais : une idée doit passer le SPRT à elle seule, on n'empile pas des gains non prouvés. |
+| 15 | Tri des coups par cases des plus courts chemins (les deux joueurs, les deux axes), à partir de la profondeur 2 | **+24 Elo** (SPRT, 1 424 parties). 15 à 25 % de positions examinées en moins à résultat égal. | Gardé → **v4**. Prédiction démentie : j'attendais quelques Elo, par la seule vitesse ; un meilleur ordre améliore aussi la qualité. |
+| 16 | Menaces en bout de recherche (gain en un coup, prolongement si l'adversaire menace), déclenchées à 2, 3 ou 4 cases de la victoire | +1 Elo (2 000 parties) / −49 / −63 | Rejeté : la recherche (5 à 7 coups) voit déjà les gains en un coup, et la vérification coûte cher à chaque feuille. |
+| 17 | Contrôle v4 contre la maison (200 ms, 400 parties) | 45,5 % (Elo −31) | v4 et v3 indiscernables contre la maison (marge ±35). |
+| 18 | Réglage Texel : 6 000 parties de v4 contre elle-même (cœurs économes), 52 192 positions étiquetées par le résultat. Erreur de contrôle 0,183 (6 critères) → 0,173 (avec mobilité, réserve, grandes pièces) | Poids réglés : tempo ~1 300-1 475 (proche des 1 133 mesurés par marmelab), largeur ~340, second axe ~850-930, mobilité 219 par coup d'écart | Duels contre v4 : 6 poids de base réglés +12 (2 000 parties, non prouvé) ; **9 poids avec candidats +35 (SPRT, 849 parties)** → **v5**. |
+| 19 | Contrôle v5 contre la maison (200 ms, 400 parties) | **53,0 % (Elo +21)** | Premier passage au-dessus de 50 % à temps égal. Deuxième tour Texel lancé sur des parties de v5. |
+| 20 | Deuxième tour Texel (48 599 positions de v5) avec trois candidats : urgence (carré des distances), menace imminente, nombre de groupes | Erreur 0,178 → 0,175 ; groupes −657, urgence −166, menace imminente ≈ 0. Duel contre v5 : **+38 (SPRT, 788 parties)** | → **v6** |
+| 21 | Contrôle v6 contre la maison (200 ms, 400 parties) | 53,6 % (Elo +25) | Pas mieux que v5 malgré +38 en duel direct : troisième signe que les gains contre soi-même se transfèrent mal. Hypothèse : le réglage sur nos propres parties apprend à battre notre style. Piste : mêler des parties contre la maison aux données. |
+| 22 | Troisième tour Texel sur données mêlées (48 643 positions de v6 contre elle-même + 39 786 contre la maison) | Erreur 0,166 → 0,163. Contre v6 : +8 (2 000 parties, non prouvé) ; contre la maison : 50,9 % (1 000 parties), moins bien que v6 (54,4 %) | Rejeté. Avec les critères actuels, le réglage semble plafonner : il faut de nouveaux critères. v6 reste la référence, et bat la maison à 54,4 % sur 3 000 parties (Elo +31 ± 12). |
+| 23 | Critère « asphyxie » : pièces en réserve sans aucune place légale (adversaire moins soi) | Texel lui donne 1 406 par pièce. Test sur les poids de v6 + asphyxie seule | Contre v6 : −15 (SPRT, 1 036 parties) ; contre la maison : 51,6 % (moins bien que v6) | Rejeté. Hypothèse : le critère ne varie qu'en toute fin de partie, que la recherche résout déjà exactement ; il ne fait que coûter du calcul. |
+| 24 | Poids de début et de fin de partie, mélangés selon le remplissage (deux poids par critère, réglés par Texel sur 189 220 positions) | Erreur de contrôle 0,170 → 0,167. Second axe 1 191 → 208, largeur 921 → ≈ 0, groupes −901 → ≈ 0, mobilité 117 → 450, asphyxie 201 → 1 774, tempo +2 678 → −1 951 (zugzwang en fin de partie). Contre v6 : −2 (2 000 parties) ; contre la maison : 52,8 % | Rejeté. Deuxième fois qu'une meilleure prédiction ne donne pas un meilleur jeu : la recherche compense déjà ces nuances, et l'asphyxie coûte du calcul. **L'évaluation de v6 semble au plateau** : les prochains gains viendront de la puissance de calcul (vitesse, multicœur, livre). |
+| 25 | Vitesse, sans changer le jeu : banc à profondeur fixe (`speed`, 40 positions, profondeur 5) avec empreinte des coups et scores. Profil macOS : 45 % du temps dans le comptage des coups (mobilité), 24 % dans les plus courts chemins. | 4,06 s → 2,08 s (×1,95) à empreinte, nombre de positions et règles identiques (537 643 cas revérifiés). Places comptées une fois par forme pour les deux joueurs ; test de pose direct sur les hauteurs ; parcours de distance réutilisé pour la largeur ; zone et groupes en un passage. | → **v7** (v6 deux fois plus rapide). Duel v7 contre v6 : **+17 Elo** (52,4 %, 2 000 parties). Doubler la vitesse vaut une quinzaine d'Elo à 100 ms. |
+| 26 | Architecture Apple M4 (MacBook Air, sans ventilateur ; 4 cœurs rapides + 6 économes ; lignes de cache de 128 octets ; L2 16 Mo) et leçons du 100 Million Row Challenge (gagnant : tous les cœurs, tables précalculées, données compactées) | Chauffe : aucune dérive sur 6 passages, aucun avertissement thermique de macOS. Table de transposition compacte (16 octets par entrée, paquets de 128 octets) : même empreinte, pas de gain de vitesse visible, mémoire ÷ 4 (32 Mo). | Gardée pour le multicœur. |
+| 27 | Multicœur (Lazy SMP) : fils partageant la table (sans verrou, vérification par XOR), décalage de profondeur d'un fil sur deux | Temps pour la profondeur 6 (20 positions) : 1 fil 4,22 s · 2 fils 3,24 s (×1,30) · 4 fils 2,87 s (×1,47) · 6 fils 3,03 s. Même empreinte. Duel 2 fils contre 1 fil (100 ms, 2 parties à la fois) : **+23 Elo** (SPRT, 1 511 parties) | Plus que le seul gain de vitesse (+17 pour ×2) : le partage de la table apporte en plus. → **v8** (1 fil par défaut, `LINKX_SEARCH_THREADS` en tournoi). |
+| 28 | **Simulation du tournoi** : v8 à 4,5 s et 4 fils contre la maison à 0,7 s (son budget réel), 2 parties à la fois | **62,3 % (Elo +87, [+39, +139])**, 200 parties, 0 faute, 18 min | On bat nettement le maître dans les conditions de jeudi. Rendements décroissants : +31 à temps égal, seulement +56 de plus avec 6× le temps et 4 fils. On s'arrête souvent avant la fin du budget : piste « mieux utiliser le temps ». |
+| 29 | Usage du temps : entamer une itération tant que moins de X % du budget est consommé ; dans une itération interrompue, garder tout coup qui bat celui de l'itération précédente | Contre v8, 2 000 parties chacun : 50 % → +9 ; **70 % → +18** ; 50 % avec l'ancienne règle de reprise → +13 | Signal cohérent mais aucun résultat prouvé seul, et le meilleur de trois est surestimé (malédiction du gagnant ; mêmes ouvertures pour les trois). **Adopté comme probable → v9**, à confirmer à temps long avec d'autres ouvertures. |
+| 30 | Mesure pour le livre (plateau vide, 6 fils sur les cœurs économes) | Profondeur 6 : 1,6 s · 7 : 15 s · 8 : 43 s (alternance pair/impair) | La profondeur 9 ou 10 sur les 17 départs est faisable en une nuit. Générateur passé en profondeur fixe avec reprise. |
+| 31 | Relecture « performance » (agent) et optimisations sans changement de jeu : voisinage à 8 en quatre décalages (A1), distance coupée à la réserve (A3), cache d'évaluation par fil de 1 Mo (A4) | Empreinte identique, règles revérifiées (537 643 cas). Cœurs rapides, 40 positions, profondeur 5 : v9 2,19 à 2,81 s → **1,59 s** | Nouvelle base (≈ ×1,4 à 1,75). Quatre idées de recherche codées, désactivées par défaut, en duel contre elle : chemins hérités pour le tri (−5,5 % de nœuds à résultat égal), vieillissement de la table, déclin de l'historique, fenêtres d'aspiration. |
+| 32 | Comparaison point par point avec le moteur de marmelab (agent, lecture seule) | **Défaut trouvé** : urgence (−166 × (distance² adverse − distance² propre)) + axe mort à 20 ⇒ adversaire bloqué (20) contre nous à 3 ≈ −20 000, contre 0 si l'adversaire est à 3. Un adversaire bloqué nous paraît pire qu'un adversaire menaçant. Leurs critères actifs qu'on n'a pas : zoneStall, caps (case posée sur une case adverse), bar3 (barre de 3 en réserve, 61 % à 1 s chez eux) ; leur mur suspendu marche avec un second axe à 94 et un axe mort à 10. Leur mobilité : mesurée nulle. | À faire : axe mort à 10 + réajustement Texel ; puis bar3, caps, zoneStall comme candidats ; puis mur suspendu avec le plafond corrigé. Nos matchs contre le maître se sont tous joués sans livre de notre côté. |
+| — | Incident : deux matchs contre le maître lancés en double (file d'attente mal arrêtée) ont tourné en même temps et écrit dans le même journal | Chiffres partiels (58 %, 54 %) invalides | Match relancé seul. Leçon : attendre un processus par son nom exact (`pgrep -x`), jamais par un motif qui peut correspondre à la commande d'attente elle-même. |
+| 33 | **Match à temps égal** : v8 (4,5 s, 4 fils, sans livre) contre le maître de marmelab (4,5 s, avec son livre à profondeur 9), 2 parties à la fois | **50,7 % (Elo +5)**, 200 parties | Égalité. À temps égal, notre avantage à 100 ms (+31) disparaît : son livre et sa recherche profonde compensent. Priorités : livre d'ouverture, correction du défaut d'urgence, efficacité de la recherche. |
+| 34 | Relecture « bugs » (agent, lecture seule) | Aucun bug qui fasse perdre une partie avec les réglages par défaut (tours passés, arrêt au temps, attente des fils, livre et reflet vérifiés ; dépassement du budget ≤ ~10 ms). À corriger : **historique jamais réduit sur un serveur qui enchaîne ~100 parties (débordement possible, biais des parties précédentes)** ; entrées résolues (profondeur ≥ poses restantes) non réutilisées aux itérations suivantes ; même position écrasée par une entrée moins profonde ; table jamais vidée entre parties (activer le vieillissement pour le serveur) ; décalage de profondeur `index % 2` inefficace au-delà de 2 fils ; fils auxiliaires recréés à chaque coup ; LMR : ne jamais réduire quand la profondeur couvre les poses restantes ; serveur : revérifier le coup du livre, compter l'attente dans la file. | Corrections prévues demain matin, par ordre de gravité. |
+| 35 | Duels de recherche contre la nouvelle base (2 000 parties chacun, 100 ms) | Chemins hérités : +13 · vieillissement de la table : +2 · déclin de l'historique + malus : +13 · **aspiration ±1 300 : −43 (SPRT, 460 parties)** | Aspiration rejetée : le score varie trop d'une itération à l'autre. Héritage et historique positifs mais non prouvés : à tester ensemble. |
+| 36 | Corrections de la relecture, codées le soir (non encore validées en duel) : historique toujours divisé par deux et tueurs remis à zéro à chaque recherche ; entrées résolues réutilisées (`depth.min(remaining)`) ; même position non écrasée par une borne moins profonde de la même recherche ; vieillissement de la table et malus d'historique par défaut ; auxiliaires décalés de 1, 2, 1, 2… et gardés d'un coup à l'autre ; LMR interdite quand la profondeur couvre les poses restantes ; serveur : coup du livre revérifié, 8 fils de requêtes | Empreinte identique à profondeur 5, −5 % de nœuds ; 6 parties à 4 fils sans faute | Duel de validation demain matin. |
+| 37 | Trois relectures par agents (stratégie marmelab, gains d'Elo mesurés ailleurs, critique de notre méthode) | Élagage = plus gros gisement mesuré ailleurs (LMR ~208 Elo, LMP ~204 dans Stockfish). Critique : match à 4,5 s joué avec le défaut d'historique ; ouvertures du banc au hasard, peu réalistes ; SPRT [0, 15] trop peu sensible ; LMR rejetée à 100 ms. | Ouvertures du banc tirées parmi les 4 meilleurs coups d'une recherche courte ; SPRT [0, 10] ; tests d'élagage à 500 ms. |
+| 38 | Réflexion pendant le tour adverse (joueur du banc : recherche de la position où l'adversaire a le trait, arrêtée à l'arrivée de la demande), 100 ms, 2 parties à la fois | 51,8 % (Elo +13), 2 000 parties | Positif ; à 100 ms la réflexion gagnée est très courte, le gain devrait croître en tournoi. À porter dans le serveur. |
+| 39 | **Référence** : base corrigée (essai 36), 4,5 s et 4 fils, contre le maître 4,5 s, 400 parties sur ouvertures réalistes | **57,5 % (Elo +53)** | Les corrections valaient ~+50 à temps long (v8 : 50,7 %). On bat le maître à temps égal. |
+| 40 | Élagage à 500 ms, SPRT [0, 10] : LMR logarithmique (dès le 3ᵉ coup, r = ln d × ln i / 2, −1 si bon historique, jamais quand la profondeur couvre les poses restantes) · LMP (8 × profondeur) · les deux | **LMR : +45 (SPRT, 864 parties)** · LMP : −3 (1 500) · les deux : +36 | LMR adoptée → **v10**. LMP rejetée. La LMR avait été rejetée à tort à 100 ms (essais 11 et 14). |
+| 41 | Livre : v10 atteint déjà en direct (4,5 s, 4 fils) la profondeur 8 à 9 sur les départs ; le livre de la nuit (profondeur 9, 248 positions, moteur v9) n'a donc plus d'avance | Départs recalculés avec v10 à profondeur 11 (9 à 52 s chacun sur 10 fils), réponses à profondeur 11 (~10 s chacune, reléguées sur les cœurs économes) ; du livre de la nuit, seules les 3 victoires prouvées sont gardées | Livre = départs 11 + réponses 11 au fil du calcul + victoires prouvées. |
+| 42 | Réflexion pendant le tour adverse dans le serveur : une table partagée par toutes les requêtes, réflexion arrêtée à l'arrivée de toute requête, lancée seulement si aucune ne cherche | Test de bout en bout, conditions du tournoi (HTTP signé, 2 parties à la fois, v10 4 fils + livre 45 positions contre la maison à 0,7 s) : **29-4-1 (86,8 %)**, temps max 4,88 s (client) / 4,64 s (serveur), 0 faute, 22 coups du livre | Serveur prêt pour la vague. |
+| 43 | Inscription et mise en ligne : ngrok (compte perso, domaine fixe `tiringly-datolitic-lorinda.ngrok-free.dev`), secret de signature, sonde OK (4 634 ms), qualification contre la maison (« The Missing Linkx », 1 177 Elo, 13ᵉ) menée sans faute. Budget ramené à 4,2 s (vu de la plateforme : ~4,4 s, marge ~1,6 s). | L'IA est au classement (1 200, 0 partie) pour la vague de cette nuit. | Leçon : un compte ngrok d'organisation imposait une restriction d'IP (ERR_NGROK_3205). |
+| 44 | Table de transposition de 512 Mo contre 32 Mo (500 ms, 1 fil) | **−108 Elo** (SPRT, 293 parties) | Rejeté. Sur le M4, la TLB couvre ~48 Mo (pages de 16 Ko, pas de grandes pages) : au-delà, chaque sonde aléatoire coûte un défaut de TLB. |
+| 45 | Deux recherches simultanées : 4 + 4 fils contre 2 + 2 (recommandation de l'agent) | 4 + 4 atteint la même profondeur ou un niveau de plus dans chaque paire | On garde 4 fils par requête, même si une partie déborde sur les cœurs économes. |
+| 46 | Coup réponse (réplique ayant réfuté le coup adverse précédent, après les tueurs), 500 ms | −3 Elo (3 000 parties) | Rejeté : le tri est déjà bon. |
+| 47 | Extension des coups uniques (singular extensions : dès la profondeur 6, coup de table testé contre les autres à profondeur réduite, marge 1 000), 500 ms | +7 Elo (3 000 parties, non prouvé) | Écarté pour la vague ; à retester à temps long. |
+| 48 | **ProbCut** (hors variante principale, dès la profondeur 5 : recherche réduite de 4 niveaux, coupure si elle dépasse la fenêtre d'une marge), 500 ms | Profondeur 7 : nœuds ÷ 2. Marge 2 000 : **+25 (SPRT, 1 738 parties)** ; marge 1 000 : **+28 (SPRT, 1 541 parties)** | Départage : marge 1 000 contre 2 000 → −18 (957 parties), on garde 2 000. À temps long (2 s, 2 fils) : 52,8 % (300) puis 55,3 % (300), soit **~54 % sur 600 parties (~+28)**. → **v11 = v10 + ProbCut (marge 2 000)**. |
+| 49 | Axe mort `LINKX_DEAD=8` contre 20 (v11, 500 ms) | −4 Elo (2 500 parties) | Rejeté. |
+| 50 | **Mode positions fixes** (`LINKX_NODES`) : la recherche s'arrête après N positions, indépendamment de la vitesse du cœur ; bancs reproductibles sur les 10 cœurs | Empreinte identique quand le mode est coupé ; même N ⇒ même coup, même profondeur | Adopté pour les bancs. Limite : ne voit pas les changements de vitesse ; tout gain doit être confirmé au temps. Les cœurs économes restent ~4 fois plus lents (sous `taskpolicy -b`, fréquence minimale). |
+| 51 | **Coup nul** (dès la profondeur 3, réduction 3, jamais au-delà de 50 cases remplies), 350 000 positions | **−19 Elo** (1 480 parties, SPRT) | Rejeté : à Linkx, jouer n'est pas toujours un avantage (zugzwang), même avant la fin de partie. |
+| 52 | **Élagage par l'évaluation statique** (profondeur ≤ 2, marge 1 500 par niveau) · même jusqu'à la profondeur 3 | Profondeur 2 : +15 (3 000 parties, positions fixes), puis +9 [−4, +22] au temps (2 800 parties, 500 ms) · profondeur 3 : 0 (1 580 parties) | Non prouvé : écarté de la v12, à retester à temps long. |
+| 53 | **Déploiement sur le serveur de Julien** (Ryzen 9 7900, 12 cœurs) : dépôt public `camilleislasse/linkx-challenge` (bot seul, étiquettes par version), Docker Compose, Traefik sur `https://oro.multimod.ovh`, secret hors dépôt. Répétition Mac (8788) contre serveur par HTTP signé, 2 parties à la fois | 66 parties : **serveur 35 – Mac 31, 0 faute**, temps max 4,26 s (réseau compris). Sonde de la plateforme : 4 354 ms | **Adresse basculée sur la plateforme** : la vague se joue depuis le serveur. Le Mac garde ngrok en secours. |
+| 54 | Mesure sur le Ryzen (4 s par coup, 5 positions, seule / deux à la fois) : 6 ou 12 fils × table de 16, 32 ou 64 Mo. Grandes pages Linux : `always` | 12 fils : même profondeur (le décompte ne compte que le fil principal, il ne compare pas les fils). **64 Mo : +15 % de positions à deux recherches** | On garde 6 fils ; table de 64 Mo pour le serveur. |
+| 55 | **Profileur** (`sample`, `samply`, fonctions empêchées d'être fusionnées sur une copie) : `placements_by_shape` (mobilité) = **30 % du temps** (95 essais de pose par évaluation) | Places comptées par **profils de relief** (colonnes où chaque marche vaut celle de la pièce, en masques de bits), même méthode pour les coups légaux ; plus listes de coups réutilisées, tri sans allocation, groupes et couches non remis à zéro | **×1,6 à coups identiques** (0,98 s → 0,62 s pour 1,5 M positions ; empreinte identique sur 6 positions ; 30 000 positions comparées à l'ancienne méthode). Puis groupes réutilisés sur place (le code machine montrait 680 octets remis à zéro et 2 × 1 360 octets recopiés par évaluation), hauteurs de pose précalculées, victoire testée seulement si les deux bords sont touchés : **×1,70**. Au temps contre v11 (500 ms, version ×1,6) : **+25 Elo [+7, +44]**, 1 400 parties. |
+| 56 | Raccourcis tirés des règles : fin de partie jouée d'avance (zone qui dépasse tout ce que l'adversaire peut encore posséder, adversaire sans chemin possible) · table rangée par position ou son miroir | Le premier ne se déclenche jamais (0 sur 20 000 parties au hasard) : cases posées + réserve = 42 pour tout joueur, et aucune zone ne dépasse 42. Le second ne sert que si la racine est symétrique, cas déjà couverts par le livre | Abandonnés. Une vraie borne demanderait les zones encore agrandissables, utile seulement là où la recherche résout déjà tout. |
+| 57 | Élagage statique et coups uniques retestés **sur la version rapide** (×1,97), 500 ms au temps / 600 000 positions | Élagage : **+2 [−15, +19]** (1 560 parties) ; coups uniques : **−9 [−28, +11]** (1 200 parties) | Écartés. Le gain de l'élagage sur v11 venait sans doute du calcul qu'il épargnait : la vitesse le rend inutile. LMR 150 : −11 (800 parties), écarté. |
+| 58 | Déploiement de la v12 : dépôt réduit au seul bot (`bot/`, 23 fichiers ; `labo/`, `docs/`, `reference/` restent en local), `CLAUDE.md` pour le Claude du serveur, `compose.traefik.yaml`, étiquettes par version. Julien passe en v12 | Empreinte identique sur le serveur ; partie signée par Internet : max 4,43 s, 0 faute | En prod pour la vague. Leçon : ne rien pousser sur GitHub sans accord explicite (un commit poussé trop tôt a dû être retiré). |
+| 59 | v13, gains à coups identiques : composantes du joueur qui pose déduites de celles du parent (+4 %), chute directe + relief par table (+3 %), profils sans boucle (+2 %) | **×2,2 sur v11** | Gardé en local. |
+| 60 | Essais de vitesse sans effet ou négatifs : cache d'évaluation ×4 (plus lent : sort du cache du processeur), motifs de bas partagés entre orientations (plus lent), vérifications d'indice retirées (nul : déjà éliminées par le compilateur), test rapide « l'adversaire peut jouer » (nul), victoire testée depuis la pièce posée (nul), groupes atteints lus par les cases voisines (−8 %), deux parcours entrelacés (nul), union des voisinages pour sauter la boucle (nul) | — | Annulés. Il ne reste plus de travail inutile visible au profil : le parcours des chemins (28 %) et la recherche (22 %) sont du calcul utile. La suite passe par un changement d'algorithme (distances mises à jour au fil des coups) ou par l'Elo (tri, évaluation). |
+| 61 | **Verdict par paires** (SPRT pentanomial, comme fishtest) : les deux parties d'une paire partent de la même ouverture, compter la paire retire le bruit de l'ouverture. Contrôle : 400 000 contre 100 000 positions | Verdict en **220 parties au lieu de 419** | Adopté par défaut dans l'arène (`--trinomial` pour l'ancien calcul). |
+| 62 | **Banc sur GitHub Actions** (dépôt public : minutes gratuites, 20 machines de 4 cœurs, 6 h par tâche) : arène dans `bench/`, workflow « Banc » par matrice de réglages ; puis un réglage réparti sur plusieurs machines (ouvertures distinctes par `--offset` : à positions fixes, une même ouverture redonne la même partie) et verdict additionné | Une machine ≈ 0,5 partie/s à 1,5 M positions, soit ~0,7 Mac ; 20 machines ≈ 15 Mac, sans chauffe | Adopté : le Mac reste libre pendant les bancs. |
+| 63 | **Arrêt anticipé** mesuré sur 200 parties tracées (score de chaque coup) : issue prouvée seule, ou même camp au-delà d'un seuil pendant K coups | Prouvée seule : 1,8 % de temps épargné. Seuil 3 000 sur 4 coups : **14 %, 0 arrêt faux** (les erreurs commencent à 2 000) | Adopté dans le banc (`--adjudicate 3000`). |
+| 64 | Banc à joueurs dans un même processus (réglages propres à chaque fil) et **cache d'évaluation partagé entre A et B** | Parties identiques coup par coup (un fil) ; vitesse : 63 s partagé, 61 s non partagé, 58 s en processus séparés | Rejeté et retiré : chaque joueur retrouve déjà l'essentiel dans son propre cache. Au passage : le banc n'est pas reproductible d'un lancement à l'autre avec plusieurs fils (la table d'un joueur dépend des parties qu'il a enchaînées), sans effet sur les statistiques. |
+| 65 | Premiers réglages au banc GitHub (v13, 1,5 M positions, par paires) | Aspiration 500 : −20 (360) · LMR dès le 2ᵉ coup : −9 (700) · LMR diviseur 225 : −14 (528) · LMR seulement hors chemins : −60 (257) · table sans vieillissement : −23 (364) | Tous rejetés. 15 autres en cours. |
+| 66 | **CI** à chaque envoi : 14 tests, empreinte de jeu sur 6 positions (`bot/tests/empreinte.tsv`, mise à jour dans le commit qui change le jeu) et image Docker du serveur avec son empreinte | Le contrôle d'empreinte rejette bien un réglage différent (6 écarts) | Adopté. |
+| 67 | Le mode d'emploi du serveur devient `DEPLOIEMENT.md` (au lieu de `CLAUDE.md`, chargé d'office par tout Claude Code ouvert sur le dépôt, y compris le nôtre) ; le journal devient le `README.md` du dépôt, avec `docs/versions.md` | — | À partir de la v13, Julien dit à son Claude : « lis DEPLOIEMENT.md ». |
+| 68 | Vérification de la v13 en conditions de prod (serveur HTTP, 6 fils, table de 64 Mo, livre, requêtes signées), deux parties simultanées | 41 coups, **max 4,21 s**, profondeur jusqu'à 18, 0 panne, 0 coup de secours ; CI verte sur x86 (tests, empreinte, image Docker) | v13 étiquetée pour la vague du 1ᵉʳ octobre, si Julien la déploie avant minuit ; sinon la v12 joue. |

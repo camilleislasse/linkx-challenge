@@ -1,6 +1,6 @@
 # Faire tourner le bot sur le serveur
 
-Ce dépôt est déployé sur le serveur de l'utilisateur, et ce fichier est ton
+Ce dépôt est déployé sur le serveur de Julien le bourek, et ce fichier est ton
 mode d'emploi. Répondre à l'utilisateur **en français**, simplement. Ici, on
 fait seulement tourner le bot (dossier `bot/`) : pas de modification du code,
 pas de tests. Le développement se fait ailleurs ; les nouvelles versions
