@@ -1,0 +1,73 @@
+# Banc : chaque réglage de la liste affronte la version de base sur sa propre
+# machine, toutes en parallèle. Les coups s'arrêtent à un nombre de positions
+# fixe, si bien que la vitesse des machines ne change pas le résultat.
+name: Banc
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branche ou étiquette à tester
+        default: dev
+        required: true
+      configs:
+        description: "Réglages, séparés par des virgules (ex. : LINKX_LMR_INDEX=2, LINKX_PROBCUT=4)"
+        required: true
+      nodes:
+        description: Positions par coup
+        default: "1500000"
+      games:
+        description: Parties au plus par réglage
+        default: "3000"
+      sprt:
+        description: Bornes du SPRT, en Elo
+        default: "0,10"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      configs: ${{ steps.split.outputs.configs }}
+    steps:
+      - id: split
+        env:
+          CONFIGS: ${{ inputs.configs }}
+        run: echo "configs=$(jq -cn --arg c "$CONFIGS" '$c | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+
+  bench:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        config: ${{ fromJson(needs.plan.outputs.configs) }}
+    name: ${{ matrix.config }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Compilation
+        run: |
+          cargo build --release --manifest-path bot/Cargo.toml --bin play
+          cargo build --release --manifest-path bench/Cargo.toml
+      - name: Banc
+        env:
+          CONFIG: ${{ matrix.config }}
+          NODES: ${{ inputs.nodes }}
+          GAMES: ${{ inputs.games }}
+          SPRT: ${{ inputs.sprt }}
+        run: |
+          PLAY="$PWD/bot/target/release/play"
+          bench/target/release/arena \
+            --a "LINKX_NODES=$NODES $CONFIG $PLAY" --b "LINKX_NODES=$NODES $PLAY" \
+            --games "$GAMES" --sprt "$SPRT" --concurrency "$(nproc)" --seed 1 | tee banc.log
+          {
+            echo "### $CONFIG"
+            echo '```'
+            tail -n 4 banc.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
