@@ -13,6 +13,10 @@
 //! partent de la même ouverture, et compter la paire retire le bruit de
 //! l'ouverture elle-même. `--trinomial` revient au décompte partie par partie.
 //!
+//! `--offset N` commence aux ouvertures de la paire N : plusieurs machines qui se
+//! partagent un même test jouent ainsi des ouvertures différentes (à nombre de
+//! positions fixe, une même ouverture redonne exactement la même partie).
+//!
 //! `--record fichier.tsv` y ajoute chaque position des parties jouées (hors
 //! ouverture), étiquetée par le résultat pour le joueur au trait, au format de
 //! `datagen`, pour le réglage automatique.
@@ -224,6 +228,7 @@ fn main() {
     let concurrency: usize = arg("--concurrency").and_then(|s| s.parse().ok()).unwrap_or(4);
     let max_games: usize = arg("--games").and_then(|s| s.parse().ok()).unwrap_or(2000);
     let seed: u64 = arg("--seed").and_then(|s| s.parse().ok()).unwrap_or(1);
+    let offset: usize = arg("--offset").and_then(|s| s.parse().ok()).unwrap_or(0);
     let sprt: Option<(f64, f64)> = arg("--sprt").map(|s| {
         let (a, b) = s.split_once(',').expect("--sprt elo0,elo1");
         (a.parse().unwrap(), b.parse().unwrap())
@@ -255,10 +260,11 @@ fn main() {
             let mut a = Player::spawn(&cmd_a);
             let mut b = Player::spawn(&cmd_b);
             while !stop.load(Ordering::Relaxed) {
-                let pair = next_pair.fetch_add(1, Ordering::Relaxed);
-                if pair * 2 >= max_games {
+                let played = next_pair.fetch_add(1, Ordering::Relaxed);
+                if played * 2 >= max_games {
                     break;
                 }
+                let pair = offset + played;
                 let start = opening(pair, seed);
                 for a_first in [true, false] {
                     if tx.send(play_game(pair, &start, a_first, &mut a, &mut b, budgets)).is_err() {

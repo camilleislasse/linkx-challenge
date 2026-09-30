@@ -1,6 +1,8 @@
-# Banc : chaque réglage de la liste affronte la version de base sur sa propre
-# machine, toutes en parallèle. Les coups s'arrêtent à un nombre de positions
-# fixe, si bien que la vitesse des machines ne change pas le résultat.
+# Banc : chaque réglage de la liste affronte la version de base. Un réglage se
+# répartit sur plusieurs machines, chacune sur ses propres ouvertures ; une
+# dernière étape additionne leurs paires et donne le verdict. Les coups
+# s'arrêtent à un nombre de positions fixe : la vitesse des machines ne change
+# pas le résultat.
 name: Banc
 
 on:
@@ -13,12 +15,15 @@ on:
       configs:
         description: "Réglages, séparés par des virgules (ex. : LINKX_LMR_INDEX=2, LINKX_PROBCUT=4)"
         required: true
+      shards:
+        description: Machines par réglage
+        default: "4"
+      games:
+        description: Parties par réglage, toutes machines confondues
+        default: "2000"
       nodes:
         description: Positions par coup
         default: "1500000"
-      games:
-        description: Parties au plus par réglage
-        default: "3000"
       sprt:
         description: Bornes du SPRT, en Elo
         default: "0,10"
@@ -30,12 +35,16 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      configs: ${{ steps.split.outputs.configs }}
+      jobs: ${{ steps.split.outputs.jobs }}
     steps:
       - id: split
         env:
           CONFIGS: ${{ inputs.configs }}
-        run: echo "configs=$(jq -cn --arg c "$CONFIGS" '$c | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+          SHARDS: ${{ inputs.shards }}
+        run: |
+          echo "jobs=$(jq -cn --arg c "$CONFIGS" --argjson s "$SHARDS" '
+            [$c | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != "")) | .[] as $config
+             | range($s) | {config: $config, shard: .}]')" >> "$GITHUB_OUTPUT"
 
   bench:
     needs: plan
@@ -44,8 +53,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        config: ${{ fromJson(needs.plan.outputs.configs) }}
-    name: ${{ matrix.config }}
+        include: ${{ fromJson(needs.plan.outputs.jobs) }}
+    name: ${{ matrix.config }} (${{ matrix.shard }})
     steps:
       - uses: actions/checkout@v4
         with:
@@ -57,17 +66,64 @@ jobs:
       - name: Banc
         env:
           CONFIG: ${{ matrix.config }}
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ inputs.shards }}
           NODES: ${{ inputs.nodes }}
           GAMES: ${{ inputs.games }}
-          SPRT: ${{ inputs.sprt }}
         run: |
           PLAY="$PWD/bot/target/release/play"
+          PER=$(( (GAMES / SHARDS + 1) / 2 * 2 ))
+          echo "CONFIG=$CONFIG" > banc.log
+          grep -m1 'model name' /proc/cpuinfo >> banc.log
           bench/target/release/arena \
             --a "LINKX_NODES=$NODES $CONFIG $PLAY" --b "LINKX_NODES=$NODES $PLAY" \
-            --games "$GAMES" --sprt "$SPRT" --concurrency "$(nproc)" --seed 1 | tee banc.log
-          {
-            echo "### $CONFIG"
-            echo '```'
-            tail -n 4 banc.log
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+            --games "$PER" --offset $(( SHARD * 100000 )) --concurrency "$(nproc)" | tee -a banc.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: banc-${{ strategy.job-index }}
+          path: banc.log
+
+  verdict:
+    needs: bench
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: banc-*
+      - name: Verdict
+        env:
+          SPRT: ${{ inputs.sprt }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import glob, math, os, re
+          elo0, elo1 = map(float, os.environ["SPRT"].split(","))
+          bound = math.log(0.95 / 0.05)
+          expected = lambda e: 1 / (1 + 10 ** (-e / 400))
+          elo = lambda s: -400 * math.log10(1 / min(max(s, 1e-6), 1 - 1e-6) - 1)
+          totals, cpus = {}, set()
+          for path in glob.glob("banc-*/banc.log"):
+              text = open(path, encoding="utf-8").read()
+              config = re.search(r"^CONFIG=(.*)$", text, re.M).group(1)
+              cpu = re.search(r"model name\s*:\s*(.*)", text)
+              if cpu:
+                  cpus.add(cpu.group(1).strip())
+              pairs = re.search(r"Paires \(0 à 2 points pour A\) : \[([0-9, ]+)\]", text)
+              if pairs:
+                  counts = [int(x) for x in pairs.group(1).split(",")]
+                  total = totals.setdefault(config, [0] * 5)
+                  totals[config] = [a + b for a, b in zip(total, counts)]
+          print("| Réglage | Paires | Elo | Intervalle à 95 % | LLR | Verdict |")
+          print("| --- | --- | --- | --- | --- | --- |")
+          for config, counts in sorted(totals.items()):
+              n = sum(counts)
+              mean = sum(c * k / 4 for k, c in enumerate(counts)) / n
+              var = sum(c * (k / 4 - mean) ** 2 for k, c in enumerate(counts)) / n
+              err = 1.96 * math.sqrt(var / n)
+              s0, s1 = expected(elo0), expected(elo1)
+              llr = n * (s1 - s0) * (2 * mean - s0 - s1) / (2 * var) if var > 0 else 0
+              verdict = "gagnant" if llr >= bound else "rejeté" if llr <= -bound else "indécis"
+              print(f"| `{config}` | {n} | {elo(mean):+.0f} | [{elo(mean - err):+.0f}, {elo(mean + err):+.0f}] | {llr:.2f} | {verdict} |")
+          print()
+          print("Processeurs : " + " · ".join(sorted(cpus)))
+          EOF
