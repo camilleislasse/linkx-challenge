@@ -38,6 +38,8 @@ pub struct Orientation {
     pub bottom: [u8; 4],
     /// Masque des cases, pièce ancrée en `(0, 0)` (bit `y * 9 + x`).
     pub mask: u128,
+    /// Nombre de cases de chaque colonne `dx`.
+    pub column_cells: [u8; 4],
 }
 
 fn normalize(points: &mut Vec<(i32, i32)>) {
@@ -77,7 +79,9 @@ fn make(shape: usize, rotation: u8, flipped: bool) -> Orientation {
     let height = cells.iter().map(|c| c.1).max().unwrap() + 1;
     let mut bottom = [0u8; 4];
     let mut mask = 0u128;
+    let mut column_cells = [0u8; 4];
     for &(x, y) in &cells {
+        column_cells[x as usize] += 1;
         bottom[x as usize] = bottom[x as usize].max(y);
         mask |= 1u128 << (y as u32 * 9 + x as u32);
     }
@@ -87,7 +91,7 @@ fn make(shape: usize, rotation: u8, flipped: bool) -> Orientation {
         let (lo, hi) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap());
         assert_eq!((hi - lo + 1) as usize, ys.len(), "colonne trouée");
     }
-    Orientation { shape: shape as u8, rotation, flipped, cells, width, height, bottom, mask }
+    Orientation { shape: shape as u8, rotation, flipped, cells, width, height, bottom, mask, column_cells }
 }
 
 /// Orientations distinctes de chaque forme, dans l'ordre canonique : rotations

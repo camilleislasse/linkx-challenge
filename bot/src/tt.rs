@@ -102,6 +102,11 @@ impl Table {
         (b.check[i].load(Relaxed) ^ data, data)
     }
 
+    /// Demande au processeur de charger le paquet de `key` en avance.
+    pub fn prefetch(&self, key: u64) {
+        prefetch(self.bucket(key) as *const Bucket as *const u8);
+    }
+
     pub fn probe(&self, key: u64) -> Option<Probe> {
         let b = self.bucket(key);
         (0..WAYS).map(|i| Table::read(b, i)).find(|&(k, _)| k == key).map(|(_, d)| unpack(d))
@@ -166,5 +171,23 @@ mod tests {
         let p = t.probe(0xDEAD_BEEF).unwrap();
         assert_eq!((p.score, p.depth, p.best), (42, 5, Some(m)));
         assert!(t.probe(0xBEEF_DEAD).is_none());
+    }
+}
+
+/// Charge en avance les 128 octets à partir de `p` (un paquet, ou une entrée du
+/// cache d'évaluation) : simple indication, sans effet sur le résultat.
+#[inline(always)]
+pub fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY : une indication de préchargement ne lit ni n'écrit la mémoire.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{0}]", "prfm pldl1keep, [{0}, #64]", in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY : une indication de préchargement ne lit ni n'écrit la mémoire.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
+        _mm_prefetch(p.wrapping_add(64) as *const i8, _MM_HINT_T0);
     }
 }

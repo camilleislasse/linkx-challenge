@@ -14,4 +14,5 @@ services:
       LINKX_BOT_SECRET: ${LINKX_BOT_SECRET:?secret absent du fichier .env}
       SEARCH_BUDGET_MS: 4200
       LINKX_SEARCH_THREADS: 6
+      LINKX_TT_MB: 64
       LINKX_BOOK: data/book-live.tsv

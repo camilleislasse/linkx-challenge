@@ -7,6 +7,7 @@
 //! **chacune** de ses colonnes touche la pile de la colonne correspondante.
 
 use crate::pieces::{orientations, Orientation, SHAPE_COUNT};
+use std::sync::OnceLock;
 
 pub const N: usize = 9;
 pub const CELLS: u32 = 81;
@@ -122,7 +123,8 @@ pub fn flood(own: u128, seed: u128) -> u128 {
 }
 
 pub fn has_connection(own: u128) -> bool {
-    flood(own, own & COL_LEFT) & COL_RIGHT != 0 || flood(own, own & ROW_TOP) & ROW_BOTTOM != 0
+    (own & COL_LEFT != 0 && own & COL_RIGHT != 0 && flood(own, own & COL_LEFT) & COL_RIGHT != 0)
+        || (own & ROW_TOP != 0 && own & ROW_BOTTOM != 0 && flood(own, own & ROW_TOP) & ROW_BOTTOM != 0)
 }
 
 pub fn largest_zone(own: u128) -> u32 {
@@ -146,6 +148,51 @@ pub struct Position {
     /// Exemplaires restants de chaque forme, par joueur.
     pub inventory: [[u8; SHAPE_COUNT]; 2],
     pub active: Player,
+}
+
+/// Bas d'une orientation, vu comme un relief : elle tient sur la colonne `c`
+/// si la hauteur de `c` laisse la place à `base` et si chaque marche entre deux
+/// colonnes voisines vaut celle de la pièce.
+struct Profile {
+    shape: u8,
+    orient: u8,
+    width: u8,
+    base: u8,
+    steps: [i8; 3],
+}
+
+fn profiles() -> &'static [Profile] {
+    static CACHE: OnceLock<Vec<Profile>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let mut all = Vec::new();
+        for (shape, list) in orientations().iter().enumerate() {
+            for (orient, o) in list.iter().enumerate() {
+                let mut steps = [0i8; 3];
+                for i in 1..o.width as usize {
+                    steps[i - 1] = o.bottom[i - 1] as i8 - o.bottom[i] as i8;
+                }
+                all.push(Profile { shape: shape as u8, orient: orient as u8, width: o.width, base: o.bottom[0], steps });
+            }
+        }
+        all
+    })
+}
+
+/// Colonnes par marche (`steps[d + 3]` : colonnes `c` où `h[c + 1] - h[c] = d`)
+/// et par place disponible (`room[b]` : colonnes où `h[c] + b <= 8`).
+struct Relief {
+    steps: [u16; 7],
+    room: [u16; 4],
+}
+
+impl Relief {
+    fn columns(&self, p: &Profile) -> u16 {
+        let mut m = self.room[p.base as usize] & ((1u16 << (10 - p.width)) - 1);
+        for i in 1..p.width as usize {
+            m &= self.steps[(p.steps[i - 1] + 3) as usize] >> (i - 1);
+        }
+        m
+    }
 }
 
 impl Position {
@@ -221,34 +268,52 @@ impl Position {
 
     pub fn legal_moves(&self, player: Player) -> Vec<Move> {
         let mut moves = Vec::with_capacity(128);
-        for (shape, list) in orientations().iter().enumerate() {
-            if self.inventory[player as usize][shape] == 0 {
+        self.legal_moves_into(player, &mut moves);
+        moves
+    }
+
+    pub fn legal_moves_into(&self, player: Player, moves: &mut Vec<Move>) {
+        moves.clear();
+        let relief = self.relief();
+        for p in profiles() {
+            if self.inventory[player as usize][p.shape as usize] == 0 {
                 continue;
             }
-            for (orient, o) in list.iter().enumerate() {
-                for column in 0..=(N as u8 - o.width) {
-                    if self.fits(o, column) {
-                        moves.push(Move { shape: shape as u8, orient: orient as u8, column });
-                    }
-                }
+            let mut columns = relief.columns(p);
+            while columns != 0 {
+                let column = columns.trailing_zeros() as u8;
+                columns &= columns - 1;
+                moves.push(Move { shape: p.shape, orient: p.orient, column });
             }
         }
-        moves
     }
 
     /// Nombre de places légales de chaque forme sur le relief actuel, toutes
     /// orientations et colonnes confondues. Il ne dépend que du relief : il sert
     /// aux deux joueurs.
     pub fn placements_by_shape(&self) -> [u32; SHAPE_COUNT] {
+        let relief = self.relief();
         let mut counts = [0; SHAPE_COUNT];
-        for (shape, list) in orientations().iter().enumerate() {
-            for o in list {
-                for column in 0..=(N as u8 - o.width) {
-                    counts[shape] += self.fits(o, column) as u32;
-                }
-            }
+        for p in profiles() {
+            counts[p.shape as usize] += relief.columns(p).count_ones();
         }
         counts
+    }
+
+    fn relief(&self) -> Relief {
+        let h = &self.heights;
+        let mut steps = [0u16; 7];
+        for c in 0..N - 1 {
+            let d = h[c + 1] as i8 - h[c] as i8;
+            if (-3..=3).contains(&d) {
+                steps[(d + 3) as usize] |= 1 << c;
+            }
+        }
+        // Sans trou, une colonne a au moins `b + 1` cases libres si sa case de la
+        // ligne `b` (depuis le haut) est vide.
+        let empty = FULL & !self.occupied();
+        let room = std::array::from_fn(|b| ((empty >> (9 * b)) & 0x1FF) as u16);
+        Relief { steps, room }
     }
 
     /// Nombre de coups légaux d'un joueur, à partir des places par forme.
@@ -268,19 +333,8 @@ impl Position {
     }
 
     pub fn has_legal_move(&self, player: Player) -> bool {
-        for (shape, list) in orientations().iter().enumerate() {
-            if self.inventory[player as usize][shape] == 0 {
-                continue;
-            }
-            for o in list {
-                for column in 0..=(N as u8 - o.width) {
-                    if self.fits(o, column) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        let relief = self.relief();
+        profiles().iter().any(|p| self.inventory[player as usize][p.shape as usize] > 0 && relief.columns(p) != 0)
     }
 
     /// Pose un coup **légal** du joueur au trait, sans résoudre la suite du tour.
@@ -290,8 +344,7 @@ impl Position {
         let p = self.active as usize;
         self.cells[p] |= o.mask << (row as u32 * 9 + m.column as u32);
         for dx in 0..o.width as usize {
-            let column_cells = o.cells.iter().filter(|c| c.0 as usize == dx).count() as u8;
-            self.heights[m.column as usize + dx] += column_cells;
+            self.heights[m.column as usize + dx] += o.column_cells[dx];
         }
         self.inventory[p][m.shape as usize] -= 1;
     }
@@ -368,6 +421,59 @@ mod tests {
             assert_eq!(mirror_cells(pos.move_cells(m)), mirrored.move_cells(r));
             assert_eq!(r.mirrored(), m);
         }
+    }
+
+    #[test]
+    fn places_par_profils_identiques() {
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut rand = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut checked = 0;
+        for _ in 0..3000 {
+            let mut pos = Position::new(Player::Blue);
+            loop {
+                let mut expected = [0u32; SHAPE_COUNT];
+                for (shape, list) in orientations().iter().enumerate() {
+                    for o in list {
+                        for column in 0..=(N as u8 - o.width) {
+                            expected[shape] += pos.fits(o, column) as u32;
+                        }
+                    }
+                }
+                assert_eq!(pos.placements_by_shape(), expected);
+                for player in [Player::Blue, Player::White] {
+                    let mut listed = Vec::new();
+                    for (shape, list) in orientations().iter().enumerate() {
+                        if pos.inventory[player as usize][shape] == 0 {
+                            continue;
+                        }
+                        for (orient, o) in list.iter().enumerate() {
+                            for column in 0..=(N as u8 - o.width) {
+                                if pos.fits(o, column) {
+                                    listed.push(Move { shape: shape as u8, orient: orient as u8, column });
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(pos.legal_moves(player), listed);
+                    assert_eq!(pos.has_legal_move(player), !listed.is_empty());
+                }
+                checked += 1;
+                let moves = pos.legal_moves(pos.active);
+                if moves.is_empty() {
+                    break;
+                }
+                let m = moves[(rand() % moves.len() as u64) as usize];
+                if !matches!(pos.play(m), After::Next | After::Pass) {
+                    break;
+                }
+            }
+        }
+        assert!(checked > 30_000);
     }
 
     #[test]

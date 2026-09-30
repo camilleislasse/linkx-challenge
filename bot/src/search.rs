@@ -7,9 +7,9 @@
 //! profondeur rend la valeur de jeu vraie, et la recherche s'arrête là.
 
 use crate::board::{After, Move, Outcome, Player, Position};
-use crate::eval::{evaluate_detailed, path_cells};
+use crate::eval::{evaluate_detailed_with, path_cells, Scratch};
 use crate::params::params;
-use crate::tt::{Bound, Table};
+use crate::tt::{prefetch, Bound, Table};
 use crate::pieces::SHAPE_COUNT;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
@@ -23,6 +23,8 @@ const MAX_PLY: usize = 64;
 const GROWTH: u32 = 5;
 /// Entrées du cache d'évaluation d'un fil (puissance de deux, ~1 Mo).
 const EVAL_CACHE: usize = 1 << 16;
+/// Coups choisis un à un avant de trier le reste.
+const LAZY_PICKS: usize = 3;
 
 struct Zobrist {
     cells: [[u64; 81]; 2],
@@ -69,6 +71,22 @@ pub fn hash(pos: &Position) -> u64 {
     h
 }
 
+/// Empreinte après le coup `m`, calculée sans le jouer, en supposant que le
+/// trait passe à l'adversaire (le seul cas où elle diffère : un tour passé).
+fn key_after_move(h: u64, pos: &Position, m: Move) -> u64 {
+    let z = zobrist();
+    let p = pos.active as usize;
+    let mut h = h ^ z.white_to_move;
+    let mut placed = pos.move_cells(m);
+    while placed != 0 {
+        h ^= z.cells[p][placed.trailing_zeros() as usize];
+        placed &= placed - 1;
+    }
+    let s = m.shape as usize;
+    let n = pos.inventory[p][s] as usize;
+    h ^ z.inventory[p][s][n] ^ z.inventory[p][s][n - 1]
+}
+
 /// Empreinte de `after`, déduite de celle de `before` par la seule pièce posée.
 fn hash_after(h: u64, before: &Position, after: &Position, m: Move) -> u64 {
     let z = zobrist();
@@ -98,6 +116,9 @@ pub struct Search {
     depth_cut: bool,
     /// La position à ce niveau vient d'un coup nul (pas deux de suite).
     nulled: [bool; MAX_PLY],
+    move_lists: Vec<Vec<Move>>,
+    key_lists: Vec<Vec<(u64, Move)>>,
+    scratch: Scratch,
     /// Budget en positions examinées (0 : aucun), pour des bancs dont le
     /// résultat ne dépend pas de la vitesse du cœur qui les exécute.
     pub node_limit: u64,
@@ -185,6 +206,9 @@ impl Search {
             played: [None; MAX_PLY],
             excluded: [None; MAX_PLY],
             nulled: [false; MAX_PLY],
+            move_lists: (0..MAX_PLY).map(|_| Vec::with_capacity(128)).collect(),
+            key_lists: (0..MAX_PLY).map(|_| Vec::with_capacity(128)).collect(),
+            scratch: Scratch::new(),
             counter: vec![None; SHAPE_COUNT * 8 * 9],
             eval_cache: vec![(0, (0, 0, 0)); EVAL_CACHE],
             helpers: Vec::new(),
@@ -219,7 +243,7 @@ impl Search {
         if slot.0 == key && key != 0 {
             return slot.1;
         }
-        let result = evaluate_detailed(pos);
+        let result = evaluate_detailed_with(pos, &mut self.scratch);
         *slot = (key, result);
         result
     }
@@ -244,6 +268,9 @@ impl Search {
             played: [None; MAX_PLY],
             excluded: [None; MAX_PLY],
             nulled: [false; MAX_PLY],
+            move_lists: (0..MAX_PLY).map(|_| Vec::with_capacity(128)).collect(),
+            key_lists: (0..MAX_PLY).map(|_| Vec::with_capacity(128)).collect(),
+            scratch: Scratch::new(),
             counter: vec![None; SHAPE_COUNT * 8 * 9],
             eval_cache: vec![(0, (0, 0, 0)); EVAL_CACHE],
             helpers: Vec::new(),
@@ -252,10 +279,12 @@ impl Search {
 
     /// Ordre d'examen : coup de la table, tueurs, puis coups qui touchent les
     /// plus courts chemins (`paths`, s'il est fourni), puis historique.
-    fn order(&self, pos: &Position, moves: &mut [Move], tt_move: Option<Move>, ply: usize, paths: u128, counter: Option<Move>) {
+    fn order(&self, pos: &Position, moves: &[Move], keys: &mut Vec<(u64, Move)>, tt_move: Option<Move>, ply: usize, paths: u128, counter: Option<Move>) {
         let killers = self.killers[ply.min(MAX_PLY - 1)];
-        moves.sort_by_cached_key(|&m| {
-            if Some(m) == tt_move {
+        // Rang, puis cases de chemin et historique décroissants ; égalités : ordre d'origine.
+        keys.clear();
+        for (i, &m) in moves.iter().enumerate() {
+            let (class, on_path, history) = if Some(m) == tt_move {
                 (0, 0, 0)
             } else if Some(m) == killers[0] {
                 (1, 0, 0)
@@ -264,10 +293,12 @@ impl Search {
             } else if Some(m) == counter {
                 (3, 0, 0)
             } else {
-                let on_path = if paths != 0 { (pos.move_cells(m) & paths).count_ones() as i32 } else { 0 };
-                (4, -on_path, -self.history[move_index(m)])
-            }
-        });
+                let on_path = if paths != 0 { (pos.move_cells(m) & paths).count_ones() as u64 } else { 0 };
+                (4, on_path, self.history[move_index(m)] as i64)
+            };
+            let key = (class << 50) | ((81 - on_path) << 40) | ((1i64 << 31) - history) as u64;
+            keys.push(((key << 7) | i as u64, m));
+        }
     }
 
     fn negamax(&mut self, pos: &Position, key: u64, depth: u32, mut alpha: i32, beta: i32, ply: usize) -> i32 {
@@ -387,7 +418,8 @@ impl Search {
             }
         }
         let alpha_start = alpha;
-        let mut moves = pos.legal_moves(pos.active);
+        let mut moves = std::mem::take(&mut self.move_lists[ply.min(MAX_PLY - 1)]);
+        pos.legal_moves_into(pos.active, &mut moves);
         let tuning = params();
         let paths = if tuning.order_min_depth > 0 && depth >= tuning.order_min_depth {
             path_cells(pos, 0) | path_cells(pos, 1)
@@ -404,7 +436,8 @@ impl Search {
         // Réplique qui a réfuté le coup précédent ailleurs dans l'arbre.
         let previous = self.played[ply.min(MAX_PLY - 1)];
         let counter = if tuning.countermove { previous.and_then(|p| self.counter[move_index(p)]) } else { None };
-        self.order(pos, &mut moves, tt_move, ply, paths, counter);
+        let mut keys = std::mem::take(&mut self.key_lists[ply.min(MAX_PLY - 1)]);
+        self.order(pos, &moves, &mut keys, tt_move, ply, paths, counter);
         let mut best_score = -WIN - 1;
         let mut best_move = None;
         let tuning = params();
@@ -427,7 +460,21 @@ impl Search {
                 }
             }
         }
-        for (i, &m) in moves.iter().enumerate() {
+        for i in 0..keys.len() {
+            // Les premiers coups sont choisis un à un : une coupure arrive
+            // souvent avant qu'il faille trier le reste.
+            if i < LAZY_PICKS {
+                let mut best = i;
+                for j in i + 1..keys.len() {
+                    if keys[j].0 < keys[best].0 {
+                        best = j;
+                    }
+                }
+                keys.swap(i, best);
+            } else if i == LAZY_PICKS {
+                keys[i..].sort_unstable_by_key(|k| k.0);
+            }
+            let m = keys[i].1;
             if Some(m) == excluded {
                 continue;
             }
@@ -447,6 +494,11 @@ impl Search {
                 self.depth_cut = true;
                 continue;
             }
+            // La clé de l'enfant, en supposant que l'adversaire ait le trait :
+            // sa table et son évaluation se chargent pendant qu'on joue le coup.
+            let guess = key_after_move(key, pos, m);
+            self.table.prefetch(guess);
+            prefetch(&self.eval_cache[guess as usize & (EVAL_CACHE - 1)] as *const _ as *const u8);
             let mut child = pos.clone();
             let after = child.play(m);
             let child_key = hash_after(key, pos, &child, m);
@@ -515,7 +567,7 @@ impl Search {
                 }
                 if params().history_decay {
                     // Malus aux coups essayés avant sans provoquer de coupure.
-                    for &tried in &moves[..i] {
+                    for &(_, tried) in &keys[..i] {
                         self.history[move_index(tried)] -= (depth * depth) as i32;
                     }
                 }
@@ -533,6 +585,8 @@ impl Search {
         if excluded.is_none() {
             self.table.store(key, best_score, depth as u8, bound, best_move);
         }
+        self.move_lists[ply.min(MAX_PLY - 1)] = moves;
+        self.key_lists[ply.min(MAX_PLY - 1)] = keys;
         best_score
     }
 

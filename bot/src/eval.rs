@@ -23,6 +23,7 @@
 
 use crate::board::{expand, flood, Position, COL_LEFT, COL_RIGHT, FULL, ROW_BOTTOM, ROW_TOP};
 use crate::params::params;
+use std::mem::MaybeUninit;
 
 /// Distance d'un axe infranchissable, en cases.
 pub const UNREACHABLE: i32 = 20;
@@ -43,9 +44,11 @@ pub fn reserve_cells(pos: &Position, player: usize) -> i32 {
 /// coût : le parcours saute de composante en composante au lieu de les remplir
 /// case par case.
 pub struct Groups {
-    comps: [u128; MAX_GROUPS],
-    halo: [u128; MAX_GROUPS],
+    comps: [MaybeUninit<u128>; MAX_GROUPS],
+    halo: [MaybeUninit<u128>; MAX_GROUPS],
     n: usize,
+    /// Cases dont les composantes sont actuellement calculées.
+    own: Option<u128>,
 }
 
 /// Un joueur a au plus 42 cases, donc au plus 42 composantes.
@@ -53,48 +56,99 @@ const MAX_GROUPS: usize = 42;
 
 impl Groups {
     pub fn new(own: u128) -> Groups {
-        let mut g = Groups { comps: [0; MAX_GROUPS], halo: [0; MAX_GROUPS], n: 0 };
+        let mut g = Groups::empty();
+        g.fill(own);
+        g
+    }
+
+    fn empty() -> Groups {
+        Groups { comps: [MaybeUninit::uninit(); MAX_GROUPS], halo: [MaybeUninit::uninit(); MAX_GROUPS], n: 0, own: None }
+    }
+
+    /// Entre deux coups frères, les cases du joueur qui n'a pas posé ne changent
+    /// pas : ses composantes sont alors gardées.
+    fn fill(&mut self, own: u128) {
+        if self.own == Some(own) {
+            return;
+        }
+        self.own = Some(own);
+        self.n = 0;
         let mut rest = own;
-        while rest != 0 && g.n < MAX_GROUPS {
+        while rest != 0 && self.n < MAX_GROUPS {
             let seed = rest & rest.wrapping_neg();
             let comp = flood(rest, seed);
-            g.comps[g.n] = comp;
-            g.halo[g.n] = expand(comp);
-            g.n += 1;
+            self.comps[self.n] = MaybeUninit::new(comp);
+            self.halo[self.n] = MaybeUninit::new(expand(comp));
+            self.n += 1;
             rest &= !comp;
         }
-        g
+    }
+
+    fn comp(&self, i: usize) -> u128 {
+        assert!(i < self.n);
+        // SAFETY : les `n` premières cases sont écrites par `new`.
+        unsafe { self.comps[i].assume_init() }
+    }
+
+    fn halo(&self, i: usize) -> u128 {
+        assert!(i < self.n);
+        // SAFETY : les `n` premières cases sont écrites par `new`.
+        unsafe { self.halo[i].assume_init() }
     }
 
     /// Taille de la plus grande composante et nombre de composantes.
     pub fn stats(&self) -> (i32, i32) {
-        let largest = self.comps[..self.n].iter().map(|c| c.count_ones() as i32).max().unwrap_or(0);
+        let largest = (0..self.n).map(|i| self.comp(i).count_ones() as i32).max().unwrap_or(0);
         (largest, self.n as i32)
+    }
+}
+
+/// Couches d'un parcours : les `len` premières sont écrites, les suivantes valent zéro.
+struct Layers {
+    l: [MaybeUninit<u128>; UNREACHABLE as usize],
+    len: usize,
+}
+
+impl Layers {
+    #[inline(always)]
+    fn new() -> Layers {
+        Layers { l: [MaybeUninit::uninit(); UNREACHABLE as usize], len: 0 }
+    }
+
+    fn push(&mut self, layer: u128) {
+        self.l[self.len] = MaybeUninit::new(layer);
+        self.len += 1;
+    }
+
+    fn get(&self, k: usize) -> u128 {
+        // SAFETY : les `len` premières couches sont écrites par `push`.
+        if k < self.len { unsafe { self.l[k].assume_init() } } else { 0 }
     }
 }
 
 /// Couches d'un parcours en largeur : `layers[k]` est l'ensemble des cases
 /// atteignables depuis `from` en ajoutant au plus `k` cases vides. Rend la
 /// distance jusqu'à `to` (ou `UNREACHABLE`).
-fn layers(groups: &Groups, empty: u128, from: u128, to: u128, out: &mut [u128; UNREACHABLE as usize]) -> i32 {
+fn layers(groups: &Groups, empty: u128, from: u128, to: u128, out: &mut Layers) -> i32 {
     layers_within(groups, empty, from, to, UNREACHABLE - 1, out)
 }
 
 /// Comme `layers`, sans chercher au-delà de `limit` cases : un chemin plus long
 /// est de toute façon mort (la réserve ne suffit pas à le remplir).
-fn layers_within(groups: &Groups, empty: u128, from: u128, to: u128, limit: i32, out: &mut [u128; UNREACHABLE as usize]) -> i32 {
+fn layers_within(groups: &Groups, empty: u128, from: u128, to: u128, limit: i32, out: &mut Layers) -> i32 {
+    out.len = 0;
     let mut pending: u64 = if groups.n == 64 { u64::MAX } else { (1u64 << groups.n) - 1 };
     let mut reached = 0u128;
     let mut bits = pending;
     while bits != 0 {
         let i = bits.trailing_zeros() as usize;
         bits &= bits - 1;
-        if groups.comps[i] & from != 0 {
-            reached |= groups.comps[i];
+        if groups.comp(i) & from != 0 {
+            reached |= groups.comp(i);
             pending &= !(1 << i);
         }
     }
-    out[0] = reached;
+    out.push(reached);
     if reached & to != 0 {
         return 0;
     }
@@ -105,12 +159,12 @@ fn layers_within(groups: &Groups, empty: u128, from: u128, to: u128, limit: i32,
         while bits != 0 {
             let i = bits.trailing_zeros() as usize;
             bits &= bits - 1;
-            if groups.halo[i] & new != 0 {
-                next |= groups.comps[i];
+            if groups.halo(i) & new != 0 {
+                next |= groups.comp(i);
                 pending &= !(1 << i);
             }
         }
-        out[k as usize] = next;
+        out.push(next);
         if next & to != 0 {
             return k;
         }
@@ -124,30 +178,30 @@ fn layers_within(groups: &Groups, empty: u128, from: u128, to: u128, limit: i32,
 
 /// Nombre minimal de cases vides à ajouter à `own` pour relier `from` à `to`.
 pub fn distance(own: u128, empty: u128, from: u128, to: u128) -> i32 {
-    layers(&Groups::new(own), empty, from, to, &mut [0; UNREACHABLE as usize])
+    layers(&Groups::new(own), empty, from, to, &mut Layers::new())
 }
 
 /// Cases vides situées sur au moins un plus court chemin de `from` à `to`,
 /// sachant que ce plus court chemin en demande `d` et que `forward` en sont les
 /// couches depuis `from`. Une case vide à `k` depuis `from` (elle comprise) et à
 /// `d + 1 - k` depuis `to` (elle comprise) en fait partie.
-fn width(groups: &Groups, empty: u128, from: u128, to: u128, d: i32, forward: &[u128; UNREACHABLE as usize]) -> u32 {
-    let mut backward = [0u128; UNREACHABLE as usize];
+fn width(groups: &Groups, empty: u128, from: u128, to: u128, d: i32, forward: &Layers) -> u32 {
+    let mut backward = Layers::new();
     layers(groups, empty, to, from, &mut backward);
-    let exactly = |l: &[u128; UNREACHABLE as usize], k: i32| l[k as usize] & !if k > 0 { l[k as usize - 1] } else { 0 };
+    let exactly = |l: &Layers, k: i32| l.get(k as usize) & !if k > 0 { l.get(k as usize - 1) } else { 0 };
     (1..=d).map(|k| (empty & exactly(forward, k) & exactly(&backward, d + 1 - k)).count_ones()).sum()
 }
 
 /// Cases vides situées sur au moins un plus court chemin de `from` à `to`.
 fn shortest_cells(groups: &Groups, empty: u128, from: u128, to: u128) -> u128 {
-    let mut forward = [0u128; UNREACHABLE as usize];
-    let mut backward = [0u128; UNREACHABLE as usize];
+    let mut forward = Layers::new();
+    let mut backward = Layers::new();
     let d = layers(groups, empty, from, to, &mut forward);
     if d == 0 || d >= UNREACHABLE {
         return 0;
     }
     layers(groups, empty, to, from, &mut backward);
-    let exactly = |l: &[u128; UNREACHABLE as usize], k: i32| l[k as usize] & !if k > 0 { l[k as usize - 1] } else { 0 };
+    let exactly = |l: &Layers, k: i32| l.get(k as usize) & !if k > 0 { l.get(k as usize - 1) } else { 0 };
     (1..=d).fold(0, |acc, k| acc | (empty & exactly(&forward, k) & exactly(&backward, d + 1 - k)))
 }
 
@@ -190,8 +244,8 @@ fn axes_with(pos: &Position, player: usize, groups: &Groups) -> (i32, i32, u32) 
     };
     let reserve = reserve_cells(pos, player);
     let alive = |d: i32| if d > reserve { UNREACHABLE } else { d };
-    let mut forward_h = [0u128; UNREACHABLE as usize];
-    let mut forward_v = [0u128; UNREACHABLE as usize];
+    let mut forward_h = Layers::new();
+    let mut forward_v = Layers::new();
     let h = alive(layers_within(groups, empty_h, COL_LEFT, COL_RIGHT, reserve, &mut forward_h));
     let v = alive(layers_within(groups, empty_v, ROW_TOP, ROW_BOTTOM, reserve, &mut forward_v));
     let near = h.min(v);
@@ -239,11 +293,31 @@ pub fn end_weights() -> [f64; F] {
 /// Critères d'une position, du point de vue du joueur au trait, et distances de
 /// l'axe le plus proche du joueur au trait et de son adversaire. `all` calcule
 /// aussi les critères de poids nul, pour le réglage automatique.
-fn feature_vector(pos: &Position, all: bool) -> ([f64; F], i32, i32) {
+/// Groupes des deux joueurs, remplis sur place à chaque évaluation.
+pub struct Scratch {
+    mine: Groups,
+    theirs: Groups,
+}
+
+impl Scratch {
+    pub fn new() -> Scratch {
+        Scratch { mine: Groups::empty(), theirs: Groups::empty() }
+    }
+}
+
+impl Default for Scratch {
+    fn default() -> Self {
+        Scratch::new()
+    }
+}
+
+fn feature_vector(pos: &Position, all: bool, scratch: &mut Scratch) -> ([f64; F], i32, i32) {
     let p = params();
     let me = pos.active as usize;
     let opp = 1 - me;
-    let (my_groups, their_groups) = (Groups::new(pos.cells[me]), Groups::new(pos.cells[opp]));
+    scratch.mine.fill(pos.cells[me]);
+    scratch.theirs.fill(pos.cells[opp]);
+    let (my_groups, their_groups) = (&scratch.mine, &scratch.theirs);
     let (mn, mf, mw) = axes_with(pos, me, &my_groups);
     let (on, of, ow) = axes_with(pos, opp, &their_groups);
     let cap = |w: u32| w.min(p.width_cap as u32) as f64;
@@ -279,7 +353,7 @@ fn feature_vector(pos: &Position, all: bool) -> ([f64; F], i32, i32) {
 
 /// Critères d'une position (tous calculés), pour le réglage automatique.
 pub fn features(pos: &Position) -> [f64; F] {
-    feature_vector(pos, true).0
+    feature_vector(pos, true, &mut Scratch::new()).0
 }
 
 /// Évaluation, et distance de l'axe le plus proche du joueur au trait et de son
@@ -288,7 +362,11 @@ pub fn features(pos: &Position) -> [f64; F] {
 /// Chaque critère a un poids de début et un poids de fin de partie, mélangés
 /// selon l'avancement : l'importance d'un critère change au fil de la partie.
 pub fn evaluate_detailed(pos: &Position) -> (i32, i32, i32) {
-    let (f, my_near, their_near) = feature_vector(pos, false);
+    evaluate_detailed_with(pos, &mut Scratch::new())
+}
+
+pub fn evaluate_detailed_with(pos: &Position, scratch: &mut Scratch) -> (i32, i32, i32) {
+    let (f, my_near, their_near) = feature_vector(pos, false, scratch);
     let t = phase(pos);
     let (open, end) = (engine_weights(), end_weights());
     let score: f64 = (0..F).map(|i| f[i] * (open[i] * (1.0 - t) + end[i] * t)).sum();
@@ -374,12 +452,12 @@ mod tests {
                     let groups = Groups::new(own);
                     for (from, to) in [(COL_LEFT, COL_RIGHT), (ROW_TOP, ROW_BOTTOM), (COL_RIGHT, COL_LEFT), (ROW_BOTTOM, ROW_TOP)] {
                         for limit in [3, 8, UNREACHABLE - 1] {
-                            let (mut a, mut b) = ([0u128; UNREACHABLE as usize], [0u128; UNREACHABLE as usize]);
+                            let (mut a, mut b) = ([0u128; UNREACHABLE as usize], Layers::new());
                             let da = layers_reference(own, empty, from, to, limit, &mut a);
                             let db = layers_within(&groups, empty, from, to, limit, &mut b);
                             assert_eq!(da, db);
                             let upto = if da >= UNREACHABLE { 0 } else { da as usize };
-                            assert_eq!(a[..=upto], b[..=upto]);
+                            assert!((0..=upto).all(|k| a[k] == b.get(k)));
                             checked += 1;
                         }
                     }
