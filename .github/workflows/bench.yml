@@ -27,6 +27,9 @@ on:
       sprt:
         description: Bornes du SPRT, en Elo
         default: "0,10"
+      adjudicate:
+        description: Arrêt anticipé (points pendant 4 coups ; 0 le désactive)
+        default: "3000"
 
 permissions:
   contents: read
@@ -70,6 +73,7 @@ jobs:
           SHARDS: ${{ inputs.shards }}
           NODES: ${{ inputs.nodes }}
           GAMES: ${{ inputs.games }}
+          ADJUDICATE: ${{ inputs.adjudicate }}
         run: |
           PLAY="$PWD/bot/target/release/play"
           PER=$(( (GAMES / SHARDS + 1) / 2 * 2 ))
@@ -77,7 +81,8 @@ jobs:
           grep -m1 'model name' /proc/cpuinfo >> banc.log
           bench/target/release/arena \
             --a "LINKX_NODES=$NODES $CONFIG $PLAY" --b "LINKX_NODES=$NODES $PLAY" \
-            --games "$PER" --offset $(( SHARD * 100000 )) --concurrency "$(nproc)" | tee -a banc.log
+            --games "$PER" --offset $(( SHARD * 100000 )) --concurrency "$(nproc)" \
+            $([ "$ADJUDICATE" != 0 ] && echo --adjudicate "$ADJUDICATE") | tee -a banc.log
       - uses: actions/upload-artifact@v4
         with:
           name: banc-${{ strategy.job-index }}

@@ -17,6 +17,12 @@
 //! partagent un même test jouent ainsi des ouvertures différentes (à nombre de
 //! positions fixe, une même ouverture redonne exactement la même partie).
 //!
+//! `--adjudicate T` arrête une partie dont l'issue ne fait plus de doute : un
+//! joueur annonce une issue prouvée, ou les deux voient le même camp à plus de
+//! `T` points pendant `ADJUDICATION_PLIES` coups. Avec `--adjudicate-check`,
+//! les parties vont au bout et le bilan dit combien d'arrêts auraient été faux
+//! et quelle part du temps ils auraient épargné.
+//!
 //! `--record fichier.tsv` y ajoute chaque position des parties jouées (hors
 //! ouverture), étiquetée par le résultat pour le joueur au trait, au format de
 //! `datagen`, pour le réglage automatique.
@@ -61,8 +67,9 @@ impl Player {
         Player { _child: child, input, output }
     }
 
-    /// Coup du joueur sur la partie `record`, dans le budget en ms.
-    fn ask(&mut self, budget: u64, record: &str) -> String {
+    /// Coup du joueur sur la partie `record`, dans le budget en ms, et le score
+    /// qu'il annonce (pour le joueur au trait), s'il en annonce un.
+    fn ask(&mut self, budget: u64, record: &str) -> (String, Option<i32>) {
         writeln!(self.input, "{budget}\t{record}").unwrap();
         self.input.flush().unwrap();
         let mut line = String::new();
@@ -70,7 +77,13 @@ impl Player {
             eprintln!("Un joueur s'est arrêté sans répondre : banc interrompu.");
             std::process::exit(2);
         }
-        line.split('\t').next().unwrap_or("").trim().to_string()
+        let mut parts = line.trim_end().split('\t');
+        let token = parts.next().unwrap_or("").trim().to_string();
+        let score = parts.next().and_then(|c| {
+            let mut words = c.split_whitespace();
+            words.find(|&w| w == "score").and_then(|_| words.next()).and_then(|w| w.parse().ok())
+        });
+        (token, score)
     }
 }
 
@@ -129,17 +142,49 @@ fn opening(index: usize, seed: u64) -> String {
     game.serialize()
 }
 
+/// Coups consécutifs où les deux joueurs doivent voir le même camp gagnant.
+const ADJUDICATION_PLIES: usize = 4;
+/// Score d'une issue prouvée par la recherche.
+const PROVEN: i32 = 999_000;
+
+/// Arrêt anticipé : seuil en points, et s'il ne fait que se mesurer.
+#[derive(Clone, Copy)]
+struct Adjudication {
+    threshold: i32,
+    check_only: bool,
+}
+
 /// Résultat d'une partie de la paire `pair`, pour A : 1 victoire, 0,5 nul, 0 défaite.
 struct GameResult {
     pair: usize,
     score_a: f64,
     record: String,
     detail: String,
+    /// Mesure de l'arrêt anticipé : issue annoncée pour A, et temps passé
+    /// avant et après le moment de l'arrêt.
+    adjudged: Option<f64>,
+    time_before: f64,
+    time_after: f64,
+    /// Score annoncé (point de vue de A) et durée en secondes de chaque coup.
+    trace: Vec<(Option<i32>, f64)>,
 }
 
-fn play_game(pair: usize, start: &str, a_is_first_to_move: bool, a: &mut Player, b: &mut Player, budgets: (u64, u64)) -> GameResult {
+fn play_game(
+    pair: usize,
+    start: &str,
+    a_is_first_to_move: bool,
+    a: &mut Player,
+    b: &mut Player,
+    budgets: (u64, u64),
+    adjudication: Option<Adjudication>,
+) -> GameResult {
     let mut game = Game::parse(start).unwrap();
     let a_color = if a_is_first_to_move { game.position.active } else { game.position.active.other() };
+    // Scores annoncés, ramenés au point de vue de A ; `None` pour un coup du livre.
+    let mut seen: Vec<Option<i32>> = Vec::new();
+    let mut adjudged: Option<f64> = None;
+    let (mut time_before, mut time_after) = (0.0, 0.0);
+    let mut trace = Vec::new();
     loop {
         if let Some(outcome) = game.outcome {
             let score_a = match outcome.winner() {
@@ -147,21 +192,67 @@ fn play_game(pair: usize, start: &str, a_is_first_to_move: bool, a: &mut Player,
                 Some(p) if p == a_color => 1.0,
                 Some(_) => 0.0,
             };
-            return GameResult { pair, score_a, record: game.serialize(), detail: format!("{outcome:?}") };
+            let detail = format!("{outcome:?}");
+            return GameResult { pair, score_a, record: game.serialize(), detail, adjudged, time_before, time_after, trace };
         }
         let a_to_move = game.position.active == a_color;
         let record = game.serialize();
-        let token = if a_to_move { a.ask(budgets.0, &record) } else { b.ask(budgets.1, &record) };
+        let started = Instant::now();
+        let (token, score) = if a_to_move { a.ask(budgets.0, &record) } else { b.ask(budgets.1, &record) };
+        let spent = started.elapsed().as_secs_f64();
+        if adjudged.is_some() { time_after += spent } else { time_before += spent }
+        seen.push(score.map(|s| if a_to_move { s } else { -s }));
+        trace.push((*seen.last().unwrap(), spent));
+        if let (Some(rule), None) = (adjudication, adjudged) {
+            adjudged = judge(&seen, rule.threshold);
+            if let (Some(result), false) = (adjudged, rule.check_only) {
+                return GameResult {
+                    pair,
+                    score_a: result,
+                    record,
+                    detail: "arrêt anticipé".into(),
+                    adjudged,
+                    time_before,
+                    time_after,
+                    trace,
+                };
+            }
+        }
         let faulty = |why: String| GameResult {
             pair,
             score_a: if a_to_move { 0.0 } else { 1.0 },
             record: record.clone(),
             detail: format!("faute de {} : {why}", if a_to_move { "A" } else { "B" }),
+            adjudged: None,
+            time_before,
+            time_after,
+            trace: trace.clone(),
         };
         let Some(m) = parse_move(&token) else { return faulty(format!("coup illisible « {token} »")) };
         if let Err(reason) = game.apply(m) {
             return faulty(format!("{} refusé ({reason})", format_move(m)));
         }
+    }
+}
+
+/// Issue pour A si la partie peut s'arrêter : une issue prouvée annoncée au
+/// dernier coup, ou les `ADJUDICATION_PLIES` derniers scores tous au-delà de
+/// `threshold` pour le même camp.
+fn judge(seen: &[Option<i32>], threshold: i32) -> Option<f64> {
+    let last = (*seen.last()?)?;
+    if last.abs() >= PROVEN {
+        return Some(if last > 0 { 1.0 } else { 0.0 });
+    }
+    if seen.len() < ADJUDICATION_PLIES {
+        return None;
+    }
+    let recent = &seen[seen.len() - ADJUDICATION_PLIES..];
+    if recent.iter().all(|s| s.is_some_and(|s| s >= threshold)) {
+        Some(1.0)
+    } else if recent.iter().all(|s| s.is_some_and(|s| s <= -threshold)) {
+        Some(0.0)
+    } else {
+        None
     }
 }
 
@@ -234,9 +325,14 @@ fn main() {
         (a.parse().unwrap(), b.parse().unwrap())
     });
     let (verbose, trinomial) = (flag("--verbose"), flag("--trinomial"));
+    let adjudication = arg("--adjudicate")
+        .and_then(|s| s.parse().ok())
+        .map(|threshold| Adjudication { threshold, check_only: flag("--adjudicate-check") });
     let mut record_file = arg("--record").map(|path| {
         std::fs::OpenOptions::new().create(true).append(true).open(path).expect("fichier --record")
     });
+    // `--trace fichier` : résultat, puis score et durée de chaque coup, par partie.
+    let mut trace_file = arg("--trace").map(|path| std::fs::File::create(path).expect("fichier --trace"));
     let bound = (0.95f64 / 0.05).ln(); // α = β = 0,05
 
     println!(
@@ -267,7 +363,7 @@ fn main() {
                 let pair = offset + played;
                 let start = opening(pair, seed);
                 for a_first in [true, false] {
-                    if tx.send(play_game(pair, &start, a_first, &mut a, &mut b, budgets)).is_err() {
+                    if tx.send(play_game(pair, &start, a_first, &mut a, &mut b, budgets, adjudication)).is_err() {
                         return;
                     }
                 }
@@ -280,9 +376,19 @@ fn main() {
     let mut games = [0.0f64; 3];
     let mut pairs = [0.0f64; 5];
     let mut first_half: HashMap<usize, f64> = HashMap::new();
+    // Mesure de l'arrêt anticipé : arrêts annoncés, arrêts faux, temps.
+    let (mut adjudged, mut wrong, mut time_before, mut time_after) = (0u32, 0u32, 0.0, 0.0);
     let mut verdict = "nombre maximal de parties atteint";
     for r in rx {
         games[(r.score_a * 2.0).round() as usize] += 1.0;
+        time_before += r.time_before;
+        time_after += r.time_after;
+        if let Some(verdict) = r.adjudged {
+            adjudged += 1;
+            if verdict != r.score_a {
+                wrong += 1;
+            }
+        }
         if let Some(first) = first_half.remove(&r.pair) {
             pairs[((first + r.score_a) * 2.0).round() as usize] += 1.0;
         } else {
@@ -290,6 +396,11 @@ fn main() {
         }
         if let Some(file) = record_file.as_mut() {
             write_positions(file, &r.record);
+        }
+        if let Some(file) = trace_file.as_mut() {
+            let plies: Vec<String> =
+                r.trace.iter().map(|(s, t)| format!("{}:{t:.3}", s.map_or("-".into(), |s| s.to_string()))).collect();
+            let _ = writeln!(file, "{}\t{}", r.score_a, plies.join(" "));
         }
         if verbose || r.detail.starts_with("faute") {
             println!("  {:<4} {}  {}", r.score_a, r.detail, r.record);
@@ -326,6 +437,12 @@ fn main() {
     println!("\nVerdict : {verdict}");
     println!("Bilan A {w}-{d}-{l} sur {n} parties, {:.1} %, Elo {:+.0}", s * 100.0, elo(s));
     println!("Paires (0 à 2 points pour A) : {:?}", pairs.map(|c| c as u32));
+    if adjudication.is_some() {
+        println!(
+            "Arrêt anticipé : {adjudged} parties sur {n}, {wrong} fausses, temps après l'arrêt {:.0} % du total",
+            100.0 * time_after / (time_before + time_after).max(1e-9)
+        );
+    }
     // Les processus des joueurs s'arrêtent avec le banc.
     std::process::exit(0);
 }
