@@ -1,0 +1,3 @@
+[build]
+# Instructions propres au processeur de la machine qui compile.
+rustflags = ["-C", "target-cpu=native"]

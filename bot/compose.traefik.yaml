@@ -1,0 +1,25 @@
+# Relais par le Traefik déjà en place sur la machine : il découvre le bot par
+# ses étiquettes et lui envoie tout ce qui arrive sur https://oro.multimod.ovh.
+# À combiner avec compose.yaml (ligne COMPOSE_FILE du fichier .env).
+#
+# Les valeurs propres à ce Traefik se lisent dans sa configuration et se
+# mettent dans .env : TRAEFIK_NETWORK (réseau Docker de Traefik, obligatoire),
+# TRAEFIK_ENTRYPOINT (point d'entrée https) et TRAEFIK_CERTRESOLVER (résolveur
+# de certificats). LINKX_HOST change le domaine si besoin.
+services:
+  bot:
+    networks:
+      - traefik
+    labels:
+      traefik.enable: "true"
+      traefik.docker.network: ${TRAEFIK_NETWORK:?réseau de Traefik absent du fichier .env}
+      traefik.http.routers.linkx.rule: Host(`${LINKX_HOST:-oro.multimod.ovh}`)
+      traefik.http.routers.linkx.entrypoints: ${TRAEFIK_ENTRYPOINT:-websecure}
+      traefik.http.routers.linkx.tls: "true"
+      traefik.http.routers.linkx.tls.certresolver: ${TRAEFIK_CERTRESOLVER:-letsencrypt}
+      traefik.http.services.linkx.loadbalancer.server.port: "21345"
+
+networks:
+  traefik:
+    external: true
+    name: ${TRAEFIK_NETWORK}

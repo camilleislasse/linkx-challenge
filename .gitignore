@@ -1,0 +1,17 @@
+# Seul le bot (bot/) est publié. Le labo, la documentation et le code de
+# marmelab restent en local.
+/labo/
+/docs/
+/reference/
+
+# Secrets : jamais dans le dépôt.
+**/.secret
+**/.env
+
+# Produits de compilation.
+**/target/
+*.zip
+
+.claude/
+.DS_Store
+node_modules/

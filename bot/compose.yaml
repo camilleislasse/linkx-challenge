@@ -1,0 +1,17 @@
+# Bot Linkx en prod. Le secret de la plateforme vient du fichier `.env`, à côté
+# de ce fichier (LINKX_BOT_SECRET=...), déposé par l'utilisateur et jamais
+# committé. Le bot n'écoute que sur la machine elle-même ; l'accès public passe
+# par Traefik (compose.traefik.yaml), sur https://oro.multimod.ovh.
+services:
+  bot:
+    build: .
+    image: linkx:${VERSION:-v11}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:21345:21345"
+    environment:
+      PORT: 21345
+      LINKX_BOT_SECRET: ${LINKX_BOT_SECRET:?secret absent du fichier .env}
+      SEARCH_BUDGET_MS: 4200
+      LINKX_SEARCH_THREADS: 6
+      LINKX_BOOK: data/book-live.tsv
