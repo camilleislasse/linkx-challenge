@@ -8,7 +8,7 @@ on:
     inputs:
       ref:
         description: Branche ou étiquette à tester
-        default: dev
+        default: main
         required: true
       configs:
         description: "Réglages, séparés par des virgules (ex. : LINKX_LMR_INDEX=2, LINKX_PROBCUT=4)"
