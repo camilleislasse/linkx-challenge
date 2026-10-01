@@ -40,7 +40,6 @@ jobs:
       nom: ${{ steps.lot.outputs.nom }}
       enregistrer: ${{ steps.lot.outputs.enregistrer }}
       parts: ${{ steps.split.outputs.parts }}
-      minutes: ${{ steps.split.outputs.minutes }}
     steps:
       - uses: actions/checkout@v4
       - name: Résultats déjà faits
@@ -64,11 +63,8 @@ jobs:
         run: |
           cargo build --release --manifest-path bench/Cargo.toml --bin deepbook
           bench/target/release/deepbook --list "$LIGNE" > positions.txt
-          count=$(wc -l < positions.txt)
-          per=$(( (count + MACHINES - 1) / MACHINES ))
-          echo "« $LIGNE » : $count positions, $per par machine"
+          echo "« $LIGNE » : $(wc -l < positions.txt) positions"
           echo "parts=$(jq -cn --argjson n "$MACHINES" '[range($n)]')" >> "$GITHUB_OUTPUT"
-          echo "minutes=$(( BUDGET / per ))" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: steps.lot.outputs.nom != ''
         with:
@@ -95,11 +91,14 @@ jobs:
       - name: Recherche
         env:
           PART: ${{ matrix.part }}
-          MINUTES: ${{ needs.plan.outputs.minutes }}
+          LINKX_SOLVER: "1"
+          LINKX_TT_MB: "4096"
+          LINKX_TT_AGING: "0"
+          LINKX_SOFT_PCT: "100"
         run: |
-          LINKX_SEARCH_THREADS=$(nproc) LINKX_TT_MB=256 \
-            bench/target/release/deepbook --positions positions.txt --part "$PART/$MACHINES" --minutes "$MINUTES" \
-            | tee livre-$PART.tsv
+          LINKX_SEARCH_THREADS=$(nproc) \
+            bench/target/release/deepbook --positions positions.txt --part "$PART/$MACHINES" --budget "$BUDGET" \
+            > livre-$PART.tsv
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -111,6 +110,7 @@ jobs:
     if: always() && needs.plan.outputs.nom != ''
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           pattern: livre-*
@@ -119,9 +119,10 @@ jobs:
         env:
           LIGNE: ${{ needs.plan.outputs.ligne }}
         run: |
-          cat livre-*.tsv | sort > lot.tsv
+          cp bench/livre_fusion.py /tmp/
+          python3 /tmp/livre_fusion.py livre-*.tsv > lot.tsv
           {
-            echo "### Lot « $LIGNE » : $(wc -l < lot.tsv) positions, $(grep -c exact lot.tsv || true) prouvées"
+            echo "### Lot « $LIGNE » : $(wc -l < lot.tsv) positions (sous-livre compris), $(grep -c exact lot.tsv || true) prouvées"
             echo '```'
             cat lot.tsv
             echo '```'
@@ -143,7 +144,7 @@ jobs:
           find . -mindepth 1 -maxdepth 1 ! -name .git ! -name resultats -exec rm -rf {} +
           mkdir -p resultats
           cp ../lot.tsv "resultats/$NOM.tsv"
-          cat resultats/*.tsv | sort -u > livre.tsv
+          python3 /tmp/livre_fusion.py resultats/*.tsv > livre.tsv
           git add resultats livre.tsv
           git -c user.name="livre" -c user.email="livre@users.noreply.github.com" commit -qm "Livre : lot $NOM"
           git push -q origin livre-data
