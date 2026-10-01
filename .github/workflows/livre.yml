@@ -1,0 +1,108 @@
+# Livre profond : chaque position qui suit la ligne donnée est cherchée
+# longuement, sur des machines en parallèle ; une dernière étape rassemble les
+# lignes du livre (notation, coup, profondeur, score, « exact » si prouvé).
+name: Livre
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branche ou étiquette du moteur
+        default: main
+        required: true
+      apres:
+        description: "Ligne de départ (vide : plateau vide ; ex. : 4Lsr14) ; le livre couvre chaque coup légal qui la suit"
+        default: ""
+      machines:
+        description: Machines en parallèle (20 au plus)
+        default: "20"
+      budget:
+        description: Minutes de calcul par machine (moins de 6 h, compilation comprise)
+        default: "320"
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      parts: ${{ steps.split.outputs.parts }}
+      minutes: ${{ steps.split.outputs.minutes }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: split
+        env:
+          APRES: ${{ inputs.apres }}
+          MACHINES: ${{ inputs.machines }}
+          BUDGET: ${{ inputs.budget }}
+        run: |
+          cargo build --release --manifest-path bench/Cargo.toml --bin deepbook
+          bench/target/release/deepbook --list "$APRES" > positions.txt
+          count=$(wc -l < positions.txt)
+          per=$(( (count + MACHINES - 1) / MACHINES ))
+          echo "$count positions, $per par machine"
+          echo "parts=$(jq -cn --argjson n "$MACHINES" '[range($n)]')" >> "$GITHUB_OUTPUT"
+          echo "minutes=$(( BUDGET / per ))" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: positions
+          path: positions.txt
+
+  calcul:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        part: ${{ fromJson(needs.plan.outputs.parts) }}
+    name: machine ${{ matrix.part }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: positions
+      - name: Compilation
+        run: cargo build --release --manifest-path bench/Cargo.toml --bin deepbook
+      - name: Recherche
+        env:
+          PART: ${{ matrix.part }}
+          MACHINES: ${{ inputs.machines }}
+          MINUTES: ${{ needs.plan.outputs.minutes }}
+        run: |
+          LINKX_SEARCH_THREADS=$(nproc) LINKX_TT_MB=256 \
+            bench/target/release/deepbook --positions positions.txt --part "$PART/$MACHINES" --minutes "$MINUTES" \
+            | tee livre-$PART.tsv
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: livre-${{ matrix.part }}
+          path: livre-${{ matrix.part }}.tsv
+
+  livre:
+    needs: calcul
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: livre-*
+          merge-multiple: true
+      - name: Rassemblement
+        run: |
+          cat livre-*.tsv | sort > livre.tsv
+          {
+            echo "### $(wc -l < livre.tsv) positions, $(grep -c exact livre.tsv || true) prouvées"
+            echo '```'
+            cat livre.tsv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: livre
+          path: livre.tsv
