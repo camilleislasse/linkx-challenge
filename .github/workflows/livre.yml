@@ -1,18 +1,18 @@
-# Livre profond : chaque position qui suit la ligne donnée est cherchée
-# longuement, sur des machines en parallèle ; une dernière étape rassemble les
-# lignes du livre (notation, coup, profondeur, score, « exact » si prouvé).
+# Livre profond : chaque position qui suit une ligne de jeu est cherchée
+# longuement, sur des machines en parallèle. Sans ligne donnée, le lot est le
+# prochain de bench/livre-plan.txt ; ses résultats s'enregistrent alors dans la
+# branche livre-data (resultats/<lot>.tsv, et livre.tsv qui les fusionne).
+# Toutes les 6 heures, le lot suivant part tout seul.
 name: Livre
 
 on:
+  schedule:
+    - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
-      ref:
-        description: Branche ou étiquette du moteur
-        default: main
-        required: true
       apres:
-        description: "Ligne de départ (vide : plateau vide ; ex. : 4Lsr14) ; le livre couvre chaque coup légal qui la suit"
-        default: ""
+        description: "Ligne de départ, ou « plan » pour le prochain lot du plan (« - » : plateau vide)"
+        default: plan
       machines:
         description: Machines en parallèle (20 au plus)
         default: "20"
@@ -21,38 +21,63 @@ on:
         default: "320"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: livre
+  cancel-in-progress: false
+
+env:
+  MACHINES: ${{ inputs.machines || '20' }}
+  BUDGET: ${{ inputs.budget || '320' }}
+  APRES: ${{ inputs.apres || 'plan' }}
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
+      ligne: ${{ steps.lot.outputs.ligne }}
+      nom: ${{ steps.lot.outputs.nom }}
+      enregistrer: ${{ steps.lot.outputs.enregistrer }}
       parts: ${{ steps.split.outputs.parts }}
       minutes: ${{ steps.split.outputs.minutes }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
+      - name: Résultats déjà faits
+        run: git clone --quiet --depth 1 --branch livre-data "https://github.com/${{ github.repository }}" donnees || mkdir -p donnees/resultats
+      - id: lot
+        run: |
+          if [ "$APRES" = plan ]; then
+            python3 bench/livre_suivant.py bench/livre-plan.txt donnees bot/data/book-live.tsv >> "$GITHUB_OUTPUT"
+            echo "enregistrer=oui" >> "$GITHUB_OUTPUT"
+          else
+            ligne=$([ "$APRES" = "-" ] && echo "" || echo "$APRES")
+            echo "ligne=$ligne" >> "$GITHUB_OUTPUT"
+            echo "nom=manuel" >> "$GITHUB_OUTPUT"
+            echo "enregistrer=non" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
       - id: split
+        if: steps.lot.outputs.nom != ''
         env:
-          APRES: ${{ inputs.apres }}
-          MACHINES: ${{ inputs.machines }}
-          BUDGET: ${{ inputs.budget }}
+          LIGNE: ${{ steps.lot.outputs.ligne }}
         run: |
           cargo build --release --manifest-path bench/Cargo.toml --bin deepbook
-          bench/target/release/deepbook --list "$APRES" > positions.txt
+          bench/target/release/deepbook --list "$LIGNE" > positions.txt
           count=$(wc -l < positions.txt)
           per=$(( (count + MACHINES - 1) / MACHINES ))
-          echo "$count positions, $per par machine"
+          echo "« $LIGNE » : $count positions, $per par machine"
           echo "parts=$(jq -cn --argjson n "$MACHINES" '[range($n)]')" >> "$GITHUB_OUTPUT"
           echo "minutes=$(( BUDGET / per ))" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
+        if: steps.lot.outputs.nom != ''
         with:
           name: positions
           path: positions.txt
 
   calcul:
     needs: plan
+    if: needs.plan.outputs.nom != ''
     runs-on: ubuntu-latest
     timeout-minutes: 355
     strategy:
@@ -62,8 +87,6 @@ jobs:
     name: machine ${{ matrix.part }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.ref }}
       - uses: actions/download-artifact@v4
         with:
           name: positions
@@ -72,7 +95,6 @@ jobs:
       - name: Recherche
         env:
           PART: ${{ matrix.part }}
-          MACHINES: ${{ inputs.machines }}
           MINUTES: ${{ needs.plan.outputs.minutes }}
         run: |
           LINKX_SEARCH_THREADS=$(nproc) LINKX_TT_MB=256 \
@@ -85,8 +107,8 @@ jobs:
           path: livre-${{ matrix.part }}.tsv
 
   livre:
-    needs: calcul
-    if: always()
+    needs: [plan, calcul]
+    if: always() && needs.plan.outputs.nom != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -94,15 +116,34 @@ jobs:
           pattern: livre-*
           merge-multiple: true
       - name: Rassemblement
+        env:
+          LIGNE: ${{ needs.plan.outputs.ligne }}
         run: |
-          cat livre-*.tsv | sort > livre.tsv
+          cat livre-*.tsv | sort > lot.tsv
           {
-            echo "### $(wc -l < livre.tsv) positions, $(grep -c exact livre.tsv || true) prouvées"
+            echo "### Lot « $LIGNE » : $(wc -l < lot.tsv) positions, $(grep -c exact lot.tsv || true) prouvées"
             echo '```'
-            cat livre.tsv
+            cat lot.tsv
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
         with:
-          name: livre
-          path: livre.tsv
+          name: lot
+          path: lot.tsv
+      - name: Enregistrement dans livre-data
+        if: needs.plan.outputs.enregistrer == 'oui'
+        env:
+          NOM: ${{ needs.plan.outputs.nom }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --quiet "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}" depot
+          cd depot
+          git checkout livre-data 2>/dev/null || git checkout --orphan livre-data
+          git rm -rq --cached . 2>/dev/null || true
+          find . -mindepth 1 -maxdepth 1 ! -name .git ! -name resultats -exec rm -rf {} +
+          mkdir -p resultats
+          cp ../lot.tsv "resultats/$NOM.tsv"
+          cat resultats/*.tsv | sort -u > livre.tsv
+          git add resultats livre.tsv
+          git -c user.name="livre" -c user.email="livre@users.noreply.github.com" commit -qm "Livre : lot $NOM"
+          git push -q origin livre-data

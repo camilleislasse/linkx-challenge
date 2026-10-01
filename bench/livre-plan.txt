@@ -1,0 +1,22 @@
+# Plan du livre profond, par ordre de priorité : chaque ligne est une ligne de
+# jeu ; le lot couvre toutes les positions qui la suivent d'un coup. « + »
+# désigne notre meilleur coup dans la position qui précède, trouvé par un lot
+# déjà fait (ou par le livre du bot) ; un lot dont le « + » n'est pas encore
+# connu attend. Le workflow « Livre » prend le premier lot ni fait ni en attente.
+
+# Les lignes des T, où nos parties avec les blancs ont basculé (coups 4 à 10).
+4Tr24 4Lr38
+4Tr21 4Lr35
+4Tr23 4Tr27
+
+# Toutes les premières positions : notre réponse à chaque premier coup possible.
+-
+
+# Les autres ouvertures qui nous ont battus, un coup plus loin.
+4Lr35 +
+4Lsr15 +
+4Lr34 +
+
+# Nos lignes avec les bleus, que nous gagnons déjà : en dernier.
+4Lsr14
+4Lsr14 3Ir15 +
