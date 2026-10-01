@@ -18,6 +18,8 @@ use std::time::{Duration, Instant};
 
 pub const WIN: i32 = 1_000_000;
 pub const WIN_THRESHOLD: i32 = WIN - 1000;
+/// Profondeur rangée pour un mat en mode preuve (sous 255 : `Table::store` y ajoute 2).
+pub const PROOF_DEPTH: u8 = 250;
 const MAX_PLY: usize = 64;
 /// Coût estimé d'une itération, en multiple de la précédente.
 const GROWTH: u32 = 5;
@@ -320,6 +322,13 @@ impl Search {
         let entry = self.table.probe(key);
         let tt_move = entry.and_then(|e| e.best);
         if let (Some(e), None) = (entry, excluded) {
+            // Mode preuve : un mat rangé se relit à son signe, quelle que soit la fenêtre.
+            if params().solver
+                && ((e.bound != Bound::Upper && e.score >= WIN_THRESHOLD)
+                    || (e.bound != Bound::Lower && e.score <= -WIN_THRESHOLD))
+            {
+                return e.score;
+            }
             if e.depth as u32 >= depth.min(remaining) {
                 let usable = match e.bound {
                     Bound::Exact => true,
@@ -586,7 +595,15 @@ impl Search {
             Bound::Exact
         };
         if excluded.is_none() {
-            self.table.store(key, best_score, depth as u8, bound, best_move);
+            // Un mat est prouvé quelle que soit la profondeur : en mode preuve, il
+            // est rangé comme assez profond pour toute itération.
+            let proof = params().solver
+                && match bound {
+                    Bound::Exact => best_score.abs() >= WIN_THRESHOLD,
+                    Bound::Lower => best_score >= WIN_THRESHOLD,
+                    Bound::Upper => best_score <= -WIN_THRESHOLD,
+                };
+            self.table.store(key, best_score, if proof { PROOF_DEPTH } else { depth as u8 }, bound, best_move);
         }
         self.move_lists[ply.min(MAX_PLY - 1)] = moves;
         self.key_lists[ply.min(MAX_PLY - 1)] = keys;
@@ -676,6 +693,11 @@ impl Search {
                 // Le coup précédent est examiné en premier : un coup qui l'a
                 // battu dans l'itération interrompue est au moins aussi bon.
                 if let Some((m, score)) = best {
+                    // Un seul coup fini suffit à prouver une victoire.
+                    if params().solver && score >= WIN_THRESHOLD {
+                        report = Report { best: m, score, depth, nodes: self.nodes, exact: true };
+                        break;
+                    }
                     let keep_score = params().partial_mode == 0;
                     if m != report.best && (!keep_score || score > report.score) {
                         report.best = m;

@@ -105,6 +105,9 @@ pub struct Params {
     /// Malus d'historique aux coups essayés sans coupure (l'historique est de
     /// toute façon divisé par deux à chaque recherche).
     pub history_decay: bool,
+    /// Mode preuve (livre profond) : un mat rangé vaut à toute profondeur et
+    /// n'est plus écrasé, un mat trouvé dans une itération interrompue est gardé.
+    pub solver: bool,
 }
 
 /// Noms des variables d'environnement des critères, dans l'ordre de `eval::FEATURE_NAMES`.
@@ -167,6 +170,7 @@ pub fn params() -> &'static Params {
         inherit_paths: env_i32("LINKX_INHERIT", 0) == 1,
         tt_aging: env_i32("LINKX_TT_AGING", 1) == 1,
         history_decay: env_i32("LINKX_HISTORY_DECAY", 1) == 1,
+        solver: env_i32("LINKX_SOLVER", 0) == 1,
         };
         let open = [
             p.primary, p.secondary, p.width, p.zone_base, p.zone_per_cell, p.tempo, p.reserve, p.big_pieces, p.mobility,

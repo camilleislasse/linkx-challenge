@@ -134,6 +134,10 @@ impl Table {
         // sauf si la nouvelle valeur est exacte ou presque aussi profonde.
         if entries[slot].0 == key {
             let old_depth = (entries[slot].1 >> 32 & 0xFF) as u8;
+            // Une preuve (mode preuve) n'est remplacée que par une autre preuve.
+            if old_depth == crate::search::PROOF_DEPTH && depth < old_depth {
+                return;
+            }
             let same_generation = (entries[slot].1 >> 53 & 63) == (self.generation.load(Relaxed) & 63);
             if same_generation && bound != Bound::Exact && depth + 2 < old_depth {
                 return;
