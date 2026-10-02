@@ -123,12 +123,17 @@ jobs:
         with:
           pattern: livre-*
           merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: positions
       - name: Rassemblement
         env:
           LIGNE: ${{ needs.plan.outputs.ligne }}
         run: |
           cp bench/livre_fusion.py /tmp/
           python3 /tmp/livre_fusion.py livre-*.tsv > lot.tsv
+          # Le coup à jouer dans la position de départ, déduit des positions du lot.
+          python3 bench/livre_parent.py "$LIGNE" positions.txt lot.tsv | tee -a lot.tsv
           {
             echo "### Lot « $LIGNE » : $(wc -l < lot.tsv) positions (sous-livre compris), $(grep -c exact lot.tsv || true) prouvées"
             echo '```'

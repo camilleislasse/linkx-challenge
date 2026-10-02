@@ -17,6 +17,18 @@
 4Lsr15 +
 4Lr34 +
 
+# Les positions exactes de nos défaites en blanc, au cas où l'adversaire
+# rejoue la même ligne.
+4Lr35 3Ir15 3Ir16
+4Lsr15 4Lsr13 4Lr14 4Lr34 3Ir13
+4Tr21 4Lr38 4Lr18
+
+# Toutes nos réponses aux T : notre défense 4Lr38 contre 4Tr24 est prouvée
+# perdante (4Lr32), on cherche la meilleure.
+4Tr24
+4Tr21
+4Tr23
+
 # Nos lignes avec les bleus, que nous gagnons déjà : en dernier.
 4Lsr14
 4Lsr14 3Ir15 +
