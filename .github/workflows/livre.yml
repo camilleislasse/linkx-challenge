@@ -2,7 +2,9 @@
 # longuement, sur des machines en parallèle. Sans ligne donnée, le lot est le
 # prochain de bench/livre-plan.txt ; ses résultats s'enregistrent alors dans la
 # branche livre-data (resultats/<lot>.tsv, et livre.tsv qui les fusionne).
-# Toutes les 6 heures, le lot suivant part tout seul.
+# Un lot du plan reprend aussi les positions perdues des lots précédents
+# (machine coupée par GitHub), et lance le suivant dès qu'il a fini. Toutes
+# les 6 heures, un lot part de toute façon, au cas où l'enchaînement casse.
 name: Livre
 
 on:
@@ -22,6 +24,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 concurrency:
   group: livre
@@ -44,13 +47,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Résultats déjà faits
         run: git clone --quiet --depth 1 --branch livre-data "https://github.com/${{ github.repository }}" donnees || mkdir -p donnees/resultats
+      - name: Compilation
+        run: cargo build --release --manifest-path bench/Cargo.toml --bin deepbook
       - id: lot
         run: |
           if [ "$APRES" = plan ]; then
-            python3 bench/livre_suivant.py bench/livre-plan.txt donnees bot/data/book-live.tsv >> "$GITHUB_OUTPUT"
+            python3 bench/livre_suivant.py bench/livre-plan.txt donnees bot/data/book-live.tsv bench/target/release/deepbook >> "$GITHUB_OUTPUT"
             echo "enregistrer=oui" >> "$GITHUB_OUTPUT"
           else
             ligne=$([ "$APRES" = "-" ] && echo "" || echo "$APRES")
+            bench/target/release/deepbook --list "$ligne" > positions.txt
             echo "ligne=$ligne" >> "$GITHUB_OUTPUT"
             echo "nom=manuel" >> "$GITHUB_OUTPUT"
             echo "enregistrer=non" >> "$GITHUB_OUTPUT"
@@ -61,9 +67,7 @@ jobs:
         env:
           LIGNE: ${{ steps.lot.outputs.ligne }}
         run: |
-          cargo build --release --manifest-path bench/Cargo.toml --bin deepbook
-          bench/target/release/deepbook --list "$LIGNE" > positions.txt
-          echo "« $LIGNE » : $(wc -l < positions.txt) positions"
+          echo "« $LIGNE » : $(wc -l < positions.txt) positions (positions perdues des lots précédents comprises)"
           echo "parts=$(jq -cn --argjson n "$MACHINES" '[range($n)]')" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         if: steps.lot.outputs.nom != ''
@@ -96,9 +100,13 @@ jobs:
           LINKX_TT_AGING: "0"
           LINKX_SOFT_PCT: "100"
         run: |
+          # Mémoire toutes les 5 min dans le journal : si GitHub coupe la machine, on saura si elle était pleine.
+          (while sleep 300; do echo "[mémoire] $(free -m | awk '/Mem:/ {print $3 " Mo utilisés sur " $2}')" >&2; done) &
+          suivi=$!
           LINKX_SEARCH_THREADS=$(nproc) \
             bench/target/release/deepbook --positions positions.txt --part "$PART/$MACHINES" --budget "$BUDGET" \
             > livre-$PART.tsv
+          kill $suivi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -148,3 +156,8 @@ jobs:
           git add resultats livre.tsv
           git -c user.name="livre" -c user.email="livre@users.noreply.github.com" commit -qm "Livre : lot $NOM"
           git push -q origin livre-data
+      - name: Lot suivant
+        if: needs.plan.outputs.enregistrer == 'oui'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run livre.yml --repo "${{ github.repository }}" --ref main
