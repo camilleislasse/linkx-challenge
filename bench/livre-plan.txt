@@ -32,3 +32,12 @@
 # Nos lignes avec les bleus, que nous gagnons déjà : en dernier.
 4Lsr14
 4Lsr14 3Ir15 +
+
+# Lundi : nos défenses actuelles aux T sont prouvées perdantes. Les meilleures
+# réponses non prouvées, un coup plus loin, et nos réponses à 4Lr35
+# (Hybrid-Challenger : 4Lr35 3Ir15 perd sur 3Ir16).
+4Lr35
+4Tr24 2r15
+4Tr21 4Lsr17
+4Tr24 4Lr31
+4Tr21 4Lr27

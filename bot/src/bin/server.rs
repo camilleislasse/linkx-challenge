@@ -9,10 +9,13 @@
 //! - THREADS                   requêtes traitées en parallèle (défaut 8)
 //! - LINKX_BOOK                livre d'ouverture (fichier), facultatif
 //! - LINKX_PONDER              "0" pour ne pas réfléchir pendant le tour adverse
+//! - LINKX_PONDER_MAX_ACTIVE   réflexion seulement si au plus autant de requêtes
+//!                             cherchent déjà (défaut 1 ; 0 : machine au repos)
 //!
 //! **Réflexion pendant le tour adverse.** Toutes les requêtes partagent une même
-//! table de transposition. Après avoir répondu, et seulement si aucune autre
-//! requête n'est en cours, le serveur cherche la position où l'adversaire a le
+//! table de transposition. Après avoir répondu, et si au plus une autre requête
+//! cherche (deux parties en même temps : une recherche et une réflexion se
+//! partagent les cœurs), le serveur cherche la position où l'adversaire a le
 //! trait : ses réponses, les plus dangereuses d'abord, et nos répliques
 //! remplissent la table, quel que soit le coup qu'il jouera. Toute requête qui
 //! arrive, pour n'importe quelle partie, arrête cette réflexion avant de chercher.
@@ -52,8 +55,11 @@ struct Config {
     table: Arc<Table>,
     ponder: Mutex<Ponder>,
     ponder_enabled: bool,
-    /// Requêtes en cours : la réflexion ne démarre que si aucune ne cherche.
+    /// Requêtes en cours : la réflexion ne démarre que si au plus
+    /// `ponder_max_active` cherchent (une recherche et une réflexion se
+    /// partagent les cœurs ; une seconde requête arrête la réflexion).
     active: AtomicUsize,
+    ponder_max_active: usize,
     book: Option<Book>,
     secret: Option<String>,
     allow_unsigned: bool,
@@ -99,13 +105,13 @@ fn stop_ponder(config: &Config) {
     }
 }
 
-/// Réfléchit sur la position où l'adversaire a le trait, si rien d'autre ne cherche.
+/// Réfléchit sur la position où l'adversaire a le trait, s'il reste des cœurs.
 fn start_ponder(config: &Config, pos: Position) {
     if !config.ponder_enabled {
         return;
     }
     let mut ponder = config.ponder.lock().unwrap_or_else(|e| e.into_inner());
-    if ponder.running.is_some() || config.active.load(SeqCst) != 0 {
+    if ponder.running.is_some() || config.active.load(SeqCst) > config.ponder_max_active {
         return;
     }
     let Some(mut engine) = ponder.engine.take() else { return };
@@ -227,6 +233,7 @@ fn main() {
         ponder: Mutex::new(Ponder { engine: Some(Search::with_table(Arc::clone(&table))), running: None }),
         ponder_enabled: std::env::var("LINKX_PONDER").as_deref() != Ok("0"),
         active: AtomicUsize::new(0),
+        ponder_max_active: env_u64("LINKX_PONDER_MAX_ACTIVE", 1) as usize,
         table,
         book: Book::from_env(),
         secret: std::env::var("LINKX_BOT_SECRET").ok().filter(|s| !s.is_empty()),
