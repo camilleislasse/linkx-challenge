@@ -12,7 +12,7 @@ Tournoi Linkx de marmelab (https://marmelab.com/linkx/). Notre bot est un
 serveur HTTP (moteur Rust, dossier `bot/`) ; la plateforme lui envoie un
 POST à chaque coup, signé en HMAC avec un secret partagé.
 
-**Vague décisive : nuit du mercredi 30 septembre au jeudi 1er octobre 2026,
+**Prochaine vague : nuit du mercredi 7 au jeudi 8 octobre 2026,
 0 h – 12 h, heure de Paris.** Environ 88 parties, 2 appels simultanés au plus,
 6 s par coup réseau compris : un dépassement fait perdre la partie.
 
