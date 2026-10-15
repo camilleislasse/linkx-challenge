@@ -41,3 +41,13 @@
 4Tr21 4Lsr17
 4Tr24 4Lr31
 4Tr21 4Lr27
+
+# Vague du 15 octobre : toutes nos défaites en blanc sortent du livre à notre
+# 2ᵉ ou 3ᵉ coup, dans ces positions. Toutes nos réponses, par nombre de défaites.
+4Tr24 4Lr31 4Lr11
+4Tr21 4Lsr17 4Lsr37
+4Lsr15 4Lsr11 3Ir12
+4Lsr15 4Lsr11 3Ir16
+4Lsr14 4Lr37 2r17
+4Lsr14 4Lr37 17
+4Tr27 4Lr32 4Lr12

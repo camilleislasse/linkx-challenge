@@ -12,114 +12,85 @@ Tournoi Linkx de marmelab (https://marmelab.com/linkx/). Notre bot est un
 serveur HTTP (moteur Rust, dossier `bot/`) ; la plateforme lui envoie un
 POST à chaque coup, signé en HMAC avec un secret partagé.
 
-**Prochaine vague : nuit du mercredi 7 au jeudi 8 octobre 2026,
-0 h – 12 h, heure de Paris.** Environ 88 parties, 2 appels simultanés au plus,
-6 s par coup réseau compris : un dépassement fait perdre la partie.
+**Une vague chaque semaine, nuit du mercredi au jeudi, 0 h – 12 h, heure de
+Paris.** Une soixantaine de parties, 2 appels simultanés au plus, 6 s par coup
+réseau compris : un dépassement fait perdre la partie.
 
-Adresse publique visée : **`https://oro.multimod.ovh`**, domaine réservé au
-bot. La plateforme exige du https, sans port explicite et avec un nom de
-domaine : le Traefik déjà en place sur la machine relaie ce domaine vers le
-conteneur du bot, qui écoute sur le port 21345 (jamais ouvert à Internet).
-Vérifier d'abord qu'aucun autre service n'utilise déjà ce domaine (`dig
-oro.multimod.ovh` doit donner l'IP de la machine).
+Adresse publique : **`https://oro.multimod.ovh`**. Le Traefik de la machine
+relaie ce domaine vers le conteneur du bot, qui écoute sur le port 21345
+(jamais ouvert à Internet).
 
 ## Trois consignes
 
-- **Le secret de la plateforme** : l'utilisateur crée lui-même `bot/.env` à
-  partir de `bot/.env.example` et y met le secret (`LINKX_BOT_SECRET=...`,
-  sans guillemets), droits 600. Ne jamais l'afficher, ni le committer, ni le mettre
-  dans l'image.
-- Faire tourner **une version précise** (étiquette `v11`, `v12`…).
+- **Le secret de la plateforme** est dans `bot/.env`, déposé par
+  l'utilisateur : ne jamais l'afficher, ni le committer, ni le mettre dans
+  l'image.
+- Faire tourner **une version précise** (étiquette `v14`, `v15`…), par
+  `make deploy`.
 - **Rien ne bascule sans l'accord de l'utilisateur**, et on ne touche pas
   aux autres services de la machine ni à la configuration de Traefik.
 
 ## Prérequis
 
-Docker avec `docker compose` (version 2 : `docker compose version`) et git.
-Toutes les commandes partent de la **racine du dépôt cloné**.
+Docker avec `docker compose`, git et make. Toutes les commandes partent de la
+**racine du dépôt cloné**.
 
 ## 1. Transmettre un message
 
 Transmets à ton utilisateur que c'est un gros bourek.
 
-## 2. Construire et lancer le bot
+## 2. Le bot sur ce serveur
 
-```
-git fetch --tags && git checkout v11
-cd bot
-VERSION=v11 docker compose -f compose.yaml up -d --build
-curl -s http://127.0.0.1:21345/health
-docker compose -f compose.yaml logs -f bot
-```
-
-À cette étape, le bot tourne sans relais (`-f compose.yaml` : Traefik n'est
-pas encore renseigné).
-
-Toujours construire sur ce serveur (le moteur est optimisé pour le processeur
-qui le compile). Vérification du moteur, qui doit afficher
-`3Ir14 … prof 9 296883 nœuds` (résultat identique au Mac) :
-
-```
-printf '60000\t4Tr24 3Ir15\n' | docker run --rm -i -e LINKX_NODES=300000 linkx:v11 play
-```
+L'installation est faite et ne bouge plus : le bot tourne dans le conteneur
+`bot-bot-1`, construit sur ce serveur (le moteur est optimisé pour le
+processeur qui le compile), et Traefik le relaie sur
+`https://oro.multimod.ovh` grâce aux lignes `TRAEFIK_…` de `bot/.env`. On ne
+touche ni à `.env` ni à la configuration de Traefik.
 
 - Le bot redémarre seul s'il plante (`restart: unless-stopped`).
-- Une ligne de journal par coup : la durée doit rester sous ~4,3 s.
+- Une ligne de journal par coup (`make logs`) : la durée doit rester sous ~4,5 s.
 - 6 fils par recherche × 2 recherches simultanées = 12 cœurs : pendant la
   vague, rien d'autre de lourd ne doit tourner sur la machine.
 
-## 3. Le relais par Traefik
+## 3. Vérifier
 
-Le domaine est servi par **Traefik**, qui découvre les conteneurs par leurs
-étiquettes : on ne touche pas à sa configuration, on ajoute seulement des
-étiquettes au bot (fichier `compose.traefik.yaml`). Il faut y reporter trois
-valeurs propres à ce Traefik, à lire sans rien modifier :
-
-- **son réseau Docker** : `docker inspect <conteneur traefik>` (rubrique
-  `Networks`), ou les étiquettes `traefik.docker.network` des autres services ;
-- **son point d'entrée https** (souvent `websecure`) et **son résolveur de
-  certificats** (souvent `letsencrypt`) : dans sa configuration statique
-  (`traefik.yml`, `traefik.toml` ou les arguments `--entrypoints…` et
-  `--certificatesresolvers…` de son conteneur), ou dans les étiquettes des
-  autres services déjà publiés.
-
-Reporter ces valeurs dans `bot/.env` (lignes `TRAEFIK_…`, déjà prévues par
-l'exemple ; la ligne `COMPOSE_FILE` fait utiliser les deux fichiers à toutes
-les commandes `docker compose`). Ne modifier que ces lignes.
-
-Puis relancer depuis `bot/` : `VERSION=v11 docker compose up -d`. Traefik
-obtient seul le certificat du domaine (quelques secondes à la première
-requête).
-
-Contrôle depuis le serveur :
+Après chaque changement de version :
 
 ```
-curl -s -X POST https://oro.multimod.ovh -d '{}' -o /dev/null -w '%{http_code}\n'
+make moteur VERSION=v15
+make check
 ```
 
-Réponse attendue : **401** (le bot répond, et refuse une requête non signée,
-ce qui est normal). Un 404 veut dire que Traefik n'a pas pris la règle
-(réseau, point d'entrée ou `traefik.enable`) ; un 502, qu'il n'atteint pas le
-bot (réseau). Les journaux de Traefik (`docker logs <conteneur traefik>`)
-disent pourquoi. Vérifier aussi que les autres services répondent toujours.
-Le test complet (requête signée) est fait depuis le Mac de l'utilisateur.
+`make moteur` doit afficher `3Ir14 … prof 9 296883 nœuds`, comme sur le Mac.
+`make check` doit afficher **401** (le bot répond et refuse une requête non
+signée, ce qui est normal). Un 404 veut dire que Traefik ne trouve plus le
+bot, un 502 qu'il ne l'atteint pas : voir les journaux de Traefik
+(`docker logs <conteneur traefik>`). Le test complet (requêtes signées) est
+fait depuis le Mac de l'utilisateur.
 
 ## 4. Changer de version
 
-Depuis la racine du dépôt :
+Toujours par le `Makefile`, depuis la racine du dépôt, avec la version
+demandée par l'utilisateur :
 
 ```
-git fetch --tags && git checkout v12
-cd bot && VERSION=v12 docker compose up -d --build
+make deploy VERSION=v15
 ```
 
-Retour arrière : même chose avec l'étiquette précédente. Éviter pendant une
-partie : la coupure de quelques secondes fait perdre le coup demandé à ce
-moment-là.
+Il récupère l'étiquette, reconstruit l'image, relance le bot, puis affiche sa
+santé et ses dernières lignes de journal. Si `make` ne trouve pas de
+`Makefile` (dépôt encore sur une version antérieure à la v15), commencer par
+`git fetch --tags && git checkout v15`, puis lancer la commande ci-dessus.
+
+Retour arrière : `make deploy` avec l'étiquette précédente. **Jamais pendant
+une vague** (nuit du mercredi au jeudi, 0 h – 12 h) : la coupure de quelques
+secondes fait perdre le coup demandé à ce moment-là.
 
 ## En cas de souci
 
-- Le bot ne répond plus : `docker compose logs bot`, puis `docker compose restart bot`.
+- État en un coup d'œil : `make status` (version, conteneur, santé) ; journal
+  en direct : `make logs` ; domaine public : `make check` (401 attendu).
+- Le bot ne répond plus : `make logs` pour voir pourquoi, puis `make restart`.
 - Requêtes refusées (401) sur de vrais coups : secret absent ou faux dans `.env`.
 - Doute sérieux : prévenir l'utilisateur. Son Mac reste prêt en secours
   (il suffit de remettre l'ancienne adresse sur la plateforme).
